@@ -156,14 +156,12 @@ func (tr *Map[K, V]) newNode(leaf bool) *mapNode[K, V] {
 		if n != nil {
 			n.isoid = tr.isoid
 			n.count = 0
-			tr.zeroItems(n.items)
 			n.items = n.items[:0]
 			if leaf {
 				n.children = nil
 			} else if n.children == nil {
 				n.children = new([]*mapNode[K, V])
 			} else {
-				tr.zeroChildren(*n.children)
 				*n.children = (*n.children)[:0]
 			}
 			return n
@@ -259,7 +257,7 @@ func (tr *Map[K, V]) Set(key K, value V) (V, bool) {
 	if tr.root == nil {
 		tr.init(0)
 		tr.root = tr.newNode(true)
-		tr.root.items = append([]mapPair[K, V]{}, item)
+		tr.root.items = append(tr.root.items, item)
 		tr.root.count = 1
 		tr.count = 1
 		return tr.empty.value, false
@@ -269,9 +267,8 @@ func (tr *Map[K, V]) Set(key K, value V) (V, bool) {
 		left := tr.root
 		right, median := tr.nodeSplit(left)
 		tr.root = tr.newNode(false)
-		*tr.root.children = make([]*mapNode[K, V], 0, tr.max+1)
-		*tr.root.children = append([]*mapNode[K, V]{}, left, right)
-		tr.root.items = append([]mapPair[K, V]{}, median)
+		*tr.root.children = append((*tr.root.children)[:0], left, right)
+		tr.root.items = append(tr.root.items[:0], median)
 		tr.root.updateCount()
 		return tr.Set(item.key, item.value)
 	}
