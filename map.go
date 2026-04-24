@@ -45,19 +45,20 @@ type mapPair[K ordered, V any] struct {
 }
 
 type Map[K ordered, V any] struct {
-	isoid                   uint64
-	root                    *mapNode[K, V]
-	count                   int
-	empty                   mapPair[K, V]
-	min                     int // min items
-	max                     int // max items
-	copyValues              bool
-	isoCopyValues           bool
-	reuseNodes              bool
-	reuseRightSplitCapacity bool
-	maxReuseNodes           int
-	freeLeaves              []*mapNode[K, V]
-	freeBranches            []*mapNode[K, V]
+	isoid                    uint64
+	root                     *mapNode[K, V]
+	count                    int
+	empty                    mapPair[K, V]
+	min                      int // min items
+	max                      int // max items
+	copyValues               bool
+	isoCopyValues            bool
+	reuseNodes               bool
+	reuseRightSplitCapacity  bool
+	reuseSplitInsertCapacity bool
+	maxReuseNodes            int
+	freeLeaves               []*mapNode[K, V]
+	freeBranches             []*mapNode[K, V]
 }
 
 func NewMap[K ordered, V any](degree int) *Map[K, V] {
@@ -76,6 +77,10 @@ type MapOptions struct {
 	// Load-heavy workloads where the right side is likely to receive more
 	// appends soon after the split.
 	ReuseRightSplitCapacity bool
+	// ReuseSplitInsertCapacity makes leaf splits preserve backing capacity on
+	// the side that will receive the pending insert. This avoids the immediate
+	// post-split append allocation for mixed insert workloads.
+	ReuseSplitInsertCapacity bool
 	// MaxReuseNodes bounds retained nodes when ReuseNodes is enabled. Values
 	// less than or equal to zero retain all owned nodes.
 	MaxReuseNodes int
@@ -85,6 +90,7 @@ func NewMapWithOptions[K ordered, V any](degree int, opts MapOptions) *Map[K, V]
 	m := NewMap[K, V](degree)
 	m.reuseNodes = opts.ReuseNodes
 	m.reuseRightSplitCapacity = opts.ReuseRightSplitCapacity
+	m.reuseSplitInsertCapacity = opts.ReuseSplitInsertCapacity
 	m.maxReuseNodes = opts.MaxReuseNodes
 	return m
 }
@@ -272,7 +278,7 @@ func (tr *Map[K, V]) Set(key K, value V) (V, bool) {
 	prev, replaced, split := tr.nodeSet(&tr.root, item)
 	if split {
 		left := tr.root
-		right, median := tr.nodeSplit(left)
+		right, median := tr.nodeSplitForInsert(left, item.key)
 		tr.root = tr.newNode(false)
 		*tr.root.children = append((*tr.root.children)[:0], left, right)
 		tr.root.items = append(tr.root.items[:0], median)
@@ -294,17 +300,7 @@ func (tr *Map[K, V]) nodeSplit(n *mapNode[K, V],
 	// right node
 	right = tr.newNode(n.leaf())
 	if tr.reuseRightSplitCapacity && n.leaf() {
-		old := n.items
-		leftItems := make([]mapPair[K, V], i, i)
-		copy(leftItems, old[:i])
-		rightLen := len(old) - i - 1
-		copy(old[:rightLen], old[i+1:])
-		tr.zeroItems(old[rightLen:])
-		right.items = old[:rightLen:cap(old)]
-		n.items = leftItems
-		right.updateCount()
-		n.updateCount()
-		return right, median
+		return tr.nodeSplitPreserveRight(n, right, i, median)
 	}
 	right.items = n.items[i+1:]
 	if !n.leaf() {
@@ -318,6 +314,51 @@ func (tr *Map[K, V]) nodeSplit(n *mapNode[K, V],
 	if !n.leaf() {
 		*n.children = (*n.children)[: i+1 : i+1]
 	}
+	n.updateCount()
+	return right, median
+}
+
+func (tr *Map[K, V]) nodeSplitForInsert(n *mapNode[K, V], key K,
+) (right *mapNode[K, V], median mapPair[K, V]) {
+	if !tr.reuseSplitInsertCapacity || !n.leaf() {
+		return tr.nodeSplit(n)
+	}
+	i := tr.max / 2
+	median = n.items[i]
+	right = tr.newNode(true)
+	if key < median.key {
+		return tr.nodeSplitPreserveLeft(n, right, i, median)
+	}
+	return tr.nodeSplitPreserveRight(n, right, i, median)
+}
+
+func (tr *Map[K, V]) nodeSplitPreserveRight(n, right *mapNode[K, V], i int,
+	median mapPair[K, V],
+) (*mapNode[K, V], mapPair[K, V]) {
+	old := n.items
+	leftItems := make([]mapPair[K, V], i, i)
+	copy(leftItems, old[:i])
+	rightLen := len(old) - i - 1
+	copy(old[:rightLen], old[i+1:])
+	tr.zeroItems(old[rightLen:])
+	right.items = old[:rightLen:cap(old)]
+	n.items = leftItems
+	right.updateCount()
+	n.updateCount()
+	return right, median
+}
+
+func (tr *Map[K, V]) nodeSplitPreserveLeft(n, right *mapNode[K, V], i int,
+	median mapPair[K, V],
+) (*mapNode[K, V], mapPair[K, V]) {
+	old := n.items
+	rightLen := len(old) - i - 1
+	rightItems := make([]mapPair[K, V], rightLen, rightLen)
+	copy(rightItems, old[i+1:])
+	tr.zeroItems(old[i:])
+	right.items = rightItems
+	n.items = old[:i:cap(old)]
+	right.updateCount()
 	n.updateCount()
 	return right, median
 }
@@ -355,7 +396,7 @@ func (tr *Map[K, V]) nodeSet(pn **mapNode[K, V], item mapPair[K, V],
 		if len(n.items) == tr.max {
 			return tr.empty.value, false, true
 		}
-		right, median := tr.nodeSplit((*n.children)[i])
+		right, median := tr.nodeSplitForInsert((*n.children)[i], item.key)
 		*n.children = append(*n.children, nil)
 		copy((*n.children)[i+1:], (*n.children)[i:])
 		(*n.children)[i+1] = right
