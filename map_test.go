@@ -1316,6 +1316,64 @@ func TestMapCopy(t *testing.T) {
 	}
 }
 
+func TestMapClearReuseReusesOwnedNodes(t *testing.T) {
+	m := NewMapWithOptions[int, int](4, MapOptions{ReuseNodes: true})
+	for i := 0; i < 1000; i++ {
+		m.Set(i, i)
+	}
+	m.Clear()
+	if m.Len() != 0 {
+		t.Fatalf("Len()=%d, want 0", m.Len())
+	}
+	reused := len(m.freeLeaves) + len(m.freeBranches)
+	if reused == 0 {
+		t.Fatal("expected Clear to retain reusable nodes")
+	}
+	m.Set(1, 10)
+	if got := len(m.freeLeaves) + len(m.freeBranches); got >= reused {
+		t.Fatalf("reusable nodes did not decrease after Set: before=%d after=%d", reused, got)
+	}
+	if v, ok := m.Get(1); !ok || v != 10 {
+		t.Fatalf("Get(1)=(%d,%t), want (10,true)", v, ok)
+	}
+}
+
+func TestMapClearReuseDoesNotRecycleSharedCopyNodes(t *testing.T) {
+	m := NewMapWithOptions[int, int](4, MapOptions{ReuseNodes: true})
+	for i := 0; i < 1000; i++ {
+		m.Set(i, i)
+	}
+	cp := m.Copy()
+	m.Clear()
+	if got := len(m.freeLeaves) + len(m.freeBranches); got != 0 {
+		t.Fatalf("reused shared nodes=%d, want 0", got)
+	}
+	for i := 0; i < 1000; i++ {
+		if v, ok := cp.Get(i); !ok || v != i {
+			t.Fatalf("copy Get(%d)=(%d,%t), want (%d,true)", i, v, ok, i)
+		}
+	}
+	m.Set(2000, 2000)
+	if _, ok := cp.Get(2000); ok {
+		t.Fatal("copy observed post-clear insert")
+	}
+}
+
+func TestMapClearReuseHonorsMaxReuseNodes(t *testing.T) {
+	const maxReuse = 3
+	m := NewMapWithOptions[int, int](2, MapOptions{
+		ReuseNodes:    true,
+		MaxReuseNodes: maxReuse,
+	})
+	for i := 0; i < 1000; i++ {
+		m.Set(i, i)
+	}
+	m.Clear()
+	if got := len(m.freeLeaves) + len(m.freeBranches); got != maxReuse {
+		t.Fatalf("retained nodes=%d, want %d", got, maxReuse)
+	}
+}
+
 type testNonCopyItem struct {
 	data string
 }

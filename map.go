@@ -53,11 +53,32 @@ type Map[K ordered, V any] struct {
 	max           int // max items
 	copyValues    bool
 	isoCopyValues bool
+	reuseNodes    bool
+	maxReuseNodes int
+	freeLeaves    []*mapNode[K, V]
+	freeBranches  []*mapNode[K, V]
 }
 
 func NewMap[K ordered, V any](degree int) *Map[K, V] {
 	m := new(Map[K, V])
 	m.init(degree)
+	return m
+}
+
+// MapOptions configures optional Map behavior.
+type MapOptions struct {
+	// ReuseNodes makes Clear retain owned tree nodes for later inserts. It is
+	// useful for short-lived maps with repeated clear/refill cycles.
+	ReuseNodes bool
+	// MaxReuseNodes bounds retained nodes when ReuseNodes is enabled. Values
+	// less than or equal to zero retain all owned nodes.
+	MaxReuseNodes int
+}
+
+func NewMapWithOptions[K ordered, V any](degree int, opts MapOptions) *Map[K, V] {
+	m := NewMap[K, V](degree)
+	m.reuseNodes = opts.ReuseNodes
+	m.maxReuseNodes = opts.MaxReuseNodes
 	return m
 }
 
@@ -109,18 +130,93 @@ func (tr *Map[K, V]) Copy() *Map[K, V] {
 func (tr *Map[K, V]) IsoCopy() *Map[K, V] {
 	tr2 := new(Map[K, V])
 	*tr2 = *tr
+	tr2.freeLeaves = nil
+	tr2.freeBranches = nil
 	tr2.isoid = newIsoID()
 	tr.isoid = newIsoID()
 	return tr2
 }
 
 func (tr *Map[K, V]) newNode(leaf bool) *mapNode[K, V] {
+	if tr.reuseNodes {
+		var n *mapNode[K, V]
+		if leaf {
+			if len(tr.freeLeaves) > 0 {
+				i := len(tr.freeLeaves) - 1
+				n = tr.freeLeaves[i]
+				tr.freeLeaves[i] = nil
+				tr.freeLeaves = tr.freeLeaves[:i]
+			}
+		} else if len(tr.freeBranches) > 0 {
+			i := len(tr.freeBranches) - 1
+			n = tr.freeBranches[i]
+			tr.freeBranches[i] = nil
+			tr.freeBranches = tr.freeBranches[:i]
+		}
+		if n != nil {
+			n.isoid = tr.isoid
+			n.count = 0
+			n.items = n.items[:0]
+			if leaf {
+				n.children = nil
+			} else if n.children == nil {
+				n.children = new([]*mapNode[K, V])
+			} else {
+				*n.children = (*n.children)[:0]
+			}
+			return n
+		}
+	}
 	n := new(mapNode[K, V])
 	n.isoid = tr.isoid
 	if !leaf {
 		n.children = new([]*mapNode[K, V])
 	}
 	return n
+}
+
+func (tr *Map[K, V]) reuseNodeCount() int {
+	return len(tr.freeLeaves) + len(tr.freeBranches)
+}
+
+func (tr *Map[K, V]) canReuseNode() bool {
+	return tr.maxReuseNodes <= 0 || tr.reuseNodeCount() < tr.maxReuseNodes
+}
+
+func (tr *Map[K, V]) zeroItems(items []mapPair[K, V]) {
+	for i := range items {
+		items[i] = tr.empty
+	}
+}
+
+func (tr *Map[K, V]) zeroChildren(children []*mapNode[K, V]) {
+	for i := range children {
+		children[i] = nil
+	}
+}
+
+func (tr *Map[K, V]) recycleNode(n *mapNode[K, V]) {
+	if n == nil || !tr.reuseNodes || n.isoid != tr.isoid {
+		return
+	}
+	if !n.leaf() {
+		for _, child := range *n.children {
+			tr.recycleNode(child)
+		}
+	}
+	if !tr.canReuseNode() {
+		return
+	}
+	tr.zeroItems(n.items)
+	n.items = n.items[:0]
+	n.count = 0
+	if n.leaf() {
+		tr.freeLeaves = append(tr.freeLeaves, n)
+		return
+	}
+	tr.zeroChildren(*n.children)
+	*n.children = (*n.children)[:0]
+	tr.freeBranches = append(tr.freeBranches, n)
 }
 
 // leaf returns true if the node is a leaf.
@@ -161,7 +257,7 @@ func (tr *Map[K, V]) Set(key K, value V) (V, bool) {
 	if tr.root == nil {
 		tr.init(0)
 		tr.root = tr.newNode(true)
-		tr.root.items = append([]mapPair[K, V]{}, item)
+		tr.root.items = append(tr.root.items, item)
 		tr.root.count = 1
 		tr.count = 1
 		return tr.empty.value, false
@@ -171,9 +267,8 @@ func (tr *Map[K, V]) Set(key K, value V) (V, bool) {
 		left := tr.root
 		right, median := tr.nodeSplit(left)
 		tr.root = tr.newNode(false)
-		*tr.root.children = make([]*mapNode[K, V], 0, tr.max+1)
-		*tr.root.children = append([]*mapNode[K, V]{}, left, right)
-		tr.root.items = append([]mapPair[K, V]{}, median)
+		*tr.root.children = append((*tr.root.children)[:0], left, right)
+		tr.root.items = append(tr.root.items[:0], median)
 		tr.root.updateCount()
 		return tr.Set(item.key, item.value)
 	}
@@ -1207,6 +1302,9 @@ func (tr *Map[K, V]) nodeKeyValues(cn **mapNode[K, V], keys []K, values []V,
 
 // Clear will delete all items.
 func (tr *Map[K, V]) Clear() {
+	if tr.reuseNodes {
+		tr.recycleNode(tr.root)
+	}
 	tr.count = 0
 	tr.root = nil
 }
