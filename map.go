@@ -809,6 +809,8 @@ func (tr *Map[K, V]) Load(key K, value V) (V, bool) {
 					tr.count++
 					return tr.empty.value, false
 				}
+			} else if n.items[len(n.items)-1].key < item.key {
+				break
 			}
 			break
 		}
@@ -823,7 +825,39 @@ func (tr *Map[K, V]) Load(key K, value V) (V, bool) {
 		}
 		n = (*n.children)[len(*n.children)-1]
 	}
+	if n.items[len(n.items)-1].key < item.key {
+		return tr.loadAppend(item)
+	}
 	return tr.Set(item.key, item.value)
+}
+
+func (tr *Map[K, V]) loadAppend(item mapPair[K, V]) (V, bool) {
+	if len(tr.root.items) == tr.max {
+		left := tr.root
+		right, median := tr.nodeSplitForInsert(left, item.key)
+		tr.root = tr.newNode(false)
+		*tr.root.children = append((*tr.root.children)[:0], left, right)
+		tr.root.items = append(tr.root.items[:0], median)
+		tr.root.updateCount()
+	}
+	n := tr.isoLoad(&tr.root, true)
+	for {
+		n.count++
+		if n.leaf() {
+			n.items = append(n.items, item)
+			tr.count++
+			return tr.empty.value, false
+		}
+		childIdx := len(*n.children) - 1
+		child := tr.isoLoad(&(*n.children)[childIdx], true)
+		if len(child.items) == tr.max {
+			right, median := tr.nodeSplitForInsert(child, item.key)
+			n.items = append(n.items, median)
+			*n.children = append(*n.children, right)
+			childIdx = len(*n.children) - 1
+		}
+		n = tr.isoLoad(&(*n.children)[childIdx], true)
+	}
 }
 
 // Min returns the minimum item in tree.

@@ -1446,6 +1446,26 @@ func TestMapReuseSplitInsertCapacityPreservesRightForRightInsert(t *testing.T) {
 	}
 }
 
+func TestMapLoadAppendSplitsFullRightEdge(t *testing.T) {
+	m := NewMapWithOptions[int, int](2, MapOptions{ReuseSplitInsertCapacity: true})
+	for i := 0; i < 128; i++ {
+		if _, replaced := m.Load(i, i); replaced {
+			t.Fatalf("Load(%d) replaced existing item", i)
+		}
+	}
+	if got, want := m.Len(), 128; got != want {
+		t.Fatalf("Len()=%d want %d", got, want)
+	}
+	for i := 0; i < 128; i++ {
+		if v, ok := m.Get(i); !ok || v != i {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", i, v, ok, i)
+		}
+	}
+	if got, _, ok := m.Max(); !ok || got != 127 {
+		t.Fatalf("Max()=(%d,_,%t), want (127,_,true)", got, ok)
+	}
+}
+
 type testNonCopyItem struct {
 	data string
 }
