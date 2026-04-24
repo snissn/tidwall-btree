@@ -1374,6 +1374,28 @@ func TestMapClearReuseHonorsMaxReuseNodes(t *testing.T) {
 	}
 }
 
+func TestMapReuseRightSplitCapacity(t *testing.T) {
+	m := NewMapWithOptions[int, int](4, MapOptions{ReuseRightSplitCapacity: true})
+	for i := 0; i < 8; i++ {
+		m.Load(i, i)
+	}
+	if m.root.leaf() {
+		t.Fatal("expected split root")
+	}
+	right := (*m.root.children)[1]
+	if got, want := len(right.items), 4; got != want {
+		t.Fatalf("right len=%d want %d", got, want)
+	}
+	if got, wantMin := cap(right.items), m.max; got < wantMin {
+		t.Fatalf("right cap=%d want >= %d", got, wantMin)
+	}
+	for i := 0; i < 8; i++ {
+		if v, ok := m.Get(i); !ok || v != i {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", i, v, ok, i)
+		}
+	}
+}
+
 type testNonCopyItem struct {
 	data string
 }

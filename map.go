@@ -45,18 +45,19 @@ type mapPair[K ordered, V any] struct {
 }
 
 type Map[K ordered, V any] struct {
-	isoid         uint64
-	root          *mapNode[K, V]
-	count         int
-	empty         mapPair[K, V]
-	min           int // min items
-	max           int // max items
-	copyValues    bool
-	isoCopyValues bool
-	reuseNodes    bool
-	maxReuseNodes int
-	freeLeaves    []*mapNode[K, V]
-	freeBranches  []*mapNode[K, V]
+	isoid                   uint64
+	root                    *mapNode[K, V]
+	count                   int
+	empty                   mapPair[K, V]
+	min                     int // min items
+	max                     int // max items
+	copyValues              bool
+	isoCopyValues           bool
+	reuseNodes              bool
+	reuseRightSplitCapacity bool
+	maxReuseNodes           int
+	freeLeaves              []*mapNode[K, V]
+	freeBranches            []*mapNode[K, V]
 }
 
 func NewMap[K ordered, V any](degree int) *Map[K, V] {
@@ -70,6 +71,11 @@ type MapOptions struct {
 	// ReuseNodes makes Clear retain owned tree nodes for later inserts. It is
 	// useful for short-lived maps with repeated clear/refill cycles.
 	ReuseNodes bool
+	// ReuseRightSplitCapacity makes leaf splits copy the left half so the right
+	// half keeps the original backing capacity. It is intended for monotonic
+	// Load-heavy workloads where the right side is likely to receive more
+	// appends soon after the split.
+	ReuseRightSplitCapacity bool
 	// MaxReuseNodes bounds retained nodes when ReuseNodes is enabled. Values
 	// less than or equal to zero retain all owned nodes.
 	MaxReuseNodes int
@@ -78,6 +84,7 @@ type MapOptions struct {
 func NewMapWithOptions[K ordered, V any](degree int, opts MapOptions) *Map[K, V] {
 	m := NewMap[K, V](degree)
 	m.reuseNodes = opts.ReuseNodes
+	m.reuseRightSplitCapacity = opts.ReuseRightSplitCapacity
 	m.maxReuseNodes = opts.MaxReuseNodes
 	return m
 }
@@ -286,6 +293,19 @@ func (tr *Map[K, V]) nodeSplit(n *mapNode[K, V],
 
 	// right node
 	right = tr.newNode(n.leaf())
+	if tr.reuseRightSplitCapacity && n.leaf() {
+		old := n.items
+		leftItems := make([]mapPair[K, V], i, i)
+		copy(leftItems, old[:i])
+		rightLen := len(old) - i - 1
+		copy(old[:rightLen], old[i+1:])
+		tr.zeroItems(old[rightLen:])
+		right.items = old[:rightLen:cap(old)]
+		n.items = leftItems
+		right.updateCount()
+		n.updateCount()
+		return right, median
+	}
 	right.items = n.items[i+1:]
 	if !n.leaf() {
 		*right.children = (*n.children)[i+1:]
