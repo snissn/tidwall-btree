@@ -396,13 +396,26 @@ func (tr *Map[K, V]) nodeSet(pn **mapNode[K, V], item mapPair[K, V],
 		if len(n.items) == tr.max {
 			return tr.empty.value, false, true
 		}
-		right, median := tr.nodeSplitForInsert((*n.children)[i], item.key)
+		left := (*n.children)[i]
+		right, median := tr.nodeSplitForInsert(left, item.key)
 		*n.children = append(*n.children, nil)
 		copy((*n.children)[i+1:], (*n.children)[i:])
 		(*n.children)[i+1] = right
 		n.items = append(n.items, tr.empty)
 		copy(n.items[i+1:], n.items[i:])
 		n.items[i] = median
+		if left.leaf() {
+			target := i
+			if !(item.key < median.key) {
+				target = i + 1
+			}
+			prev, replaced, split = tr.nodeSet(&(*n.children)[target], item)
+			if split {
+				return tr.empty.value, false, true
+			}
+			n.updateCount()
+			return prev, replaced, false
+		}
 		return tr.nodeSet(&n, item)
 	}
 	if !replaced {
