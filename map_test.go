@@ -1396,6 +1396,56 @@ func TestMapReuseRightSplitCapacity(t *testing.T) {
 	}
 }
 
+func TestMapReuseSplitInsertCapacityPreservesLeftForLeftInsert(t *testing.T) {
+	m := NewMapWithOptions[int, int](4, MapOptions{ReuseSplitInsertCapacity: true})
+	for i := 0; i < m.max; i++ {
+		m.Load(i, i)
+	}
+	m.Set(-1, -1)
+	if m.root.leaf() {
+		t.Fatal("expected split root")
+	}
+	left := (*m.root.children)[0]
+	right := (*m.root.children)[1]
+	if got, wantMin := cap(left.items), m.max; got < wantMin {
+		t.Fatalf("left cap=%d want >= %d", got, wantMin)
+	}
+	if got, want := len(left.items), 4; got != want {
+		t.Fatalf("left len=%d want %d", got, want)
+	}
+	if got, want := len(right.items), 3; got != want {
+		t.Fatalf("right len=%d want %d", got, want)
+	}
+	for i := -1; i < m.max; i++ {
+		if v, ok := m.Get(i); !ok || v != i {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", i, v, ok, i)
+		}
+	}
+}
+
+func TestMapReuseSplitInsertCapacityPreservesRightForRightInsert(t *testing.T) {
+	m := NewMapWithOptions[int, int](4, MapOptions{ReuseSplitInsertCapacity: true})
+	for i := 0; i < m.max; i++ {
+		m.Load(i, i)
+	}
+	m.Set(m.max, m.max)
+	if m.root.leaf() {
+		t.Fatal("expected split root")
+	}
+	right := (*m.root.children)[1]
+	if got, wantMin := cap(right.items), m.max; got < wantMin {
+		t.Fatalf("right cap=%d want >= %d", got, wantMin)
+	}
+	if got, want := len(right.items), 4; got != want {
+		t.Fatalf("right len=%d want %d", got, want)
+	}
+	for i := 0; i <= m.max; i++ {
+		if v, ok := m.Get(i); !ok || v != i {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", i, v, ok, i)
+		}
+	}
+}
+
 type testNonCopyItem struct {
 	data string
 }
