@@ -278,6 +278,15 @@ func (tr *Map[K, V]) Set(key K, value V) (V, bool) {
 	prev, replaced, split := tr.nodeSet(&tr.root, item)
 	if split {
 		left := tr.root
+		if left.leaf() {
+			right, median := tr.nodeSplitLeafWithInsert(left, item)
+			tr.root = tr.newNode(false)
+			*tr.root.children = append((*tr.root.children)[:0], left, right)
+			tr.root.items = append(tr.root.items[:0], median)
+			tr.root.updateCount()
+			tr.count++
+			return tr.empty.value, false
+		}
 		right, median := tr.nodeSplitForInsert(left, item.key)
 		tr.root = tr.newNode(false)
 		*tr.root.children = append((*tr.root.children)[:0], left, right)
@@ -299,9 +308,6 @@ func (tr *Map[K, V]) nodeSplit(n *mapNode[K, V],
 
 	// right node
 	right = tr.newNode(n.leaf())
-	if tr.reuseRightSplitCapacity && n.leaf() {
-		return tr.nodeSplitPreserveRight(n, right, i, median)
-	}
 	right.items = n.items[i+1:]
 	if !n.leaf() {
 		*right.children = (*n.children)[i+1:]
@@ -316,6 +322,17 @@ func (tr *Map[K, V]) nodeSplit(n *mapNode[K, V],
 	}
 	n.updateCount()
 	return right, median
+}
+
+func (tr *Map[K, V]) nodeSplitForAppend(n *mapNode[K, V],
+) (right *mapNode[K, V], median mapPair[K, V]) {
+	if !tr.reuseRightSplitCapacity || !n.leaf() {
+		return tr.nodeSplit(n)
+	}
+	i := tr.max / 2
+	median = n.items[i]
+	right = tr.newNode(true)
+	return tr.nodeSplitPreserveRight(n, right, i, median)
 }
 
 func (tr *Map[K, V]) nodeSplitForInsert(n *mapNode[K, V], key K,
@@ -363,6 +380,55 @@ func (tr *Map[K, V]) nodeSplitPreserveLeft(n, right *mapNode[K, V], i int,
 	return right, median
 }
 
+func (tr *Map[K, V]) nodeSplitLeafWithInsert(n *mapNode[K, V], item mapPair[K, V]) (
+	right *mapNode[K, V], median mapPair[K, V],
+) {
+	i, found := tr.search(n, item.key)
+	if found {
+		panic("btree: nodeSplitLeafWithInsert called for existing key")
+	}
+	old := n.items
+	total := len(old) + 1
+	mid := tr.max / 2
+	right = tr.newNode(true)
+	if i <= mid {
+		median = old[mid]
+		leftLen := mid + 1
+		rightLen := len(old) - mid - 1
+		rightItems := make([]mapPair[K, V], rightLen, rightLen)
+		copy(rightItems, old[mid+1:])
+		copy(old[i+1:leftLen], old[i:mid])
+		old[i] = item
+		tr.zeroItems(old[leftLen:])
+		right.items = rightItems
+		n.items = old[:leftLen:cap(old)]
+		right.updateCount()
+		n.updateCount()
+		return right, median
+	}
+	median = old[mid]
+	leftLen := mid
+	leftItems := make([]mapPair[K, V], leftLen, leftLen)
+	copy(leftItems, old[:leftLen])
+	rightLen := total - mid - 1
+	prefix := i - mid - 1
+	copy(old[:prefix], old[mid+1:i])
+	old[prefix] = item
+	copy(old[prefix+1:rightLen], old[i:])
+	tr.zeroItems(old[rightLen:])
+	right.items = old[:rightLen:cap(old)]
+	n.items = leftItems
+	right.updateCount()
+	n.updateCount()
+	return right, median
+}
+
+func (tr *Map[K, V]) insertLeafItem(n *mapNode[K, V], i int, item mapPair[K, V]) {
+	n.items = append(n.items, tr.empty)
+	copy(n.items[i+1:], n.items[i:])
+	n.items[i] = item
+}
+
 func (n *mapNode[K, V]) updateCount() {
 	n.count = len(n.items)
 	if !n.leaf() {
@@ -385,9 +451,7 @@ func (tr *Map[K, V]) nodeSet(pn **mapNode[K, V], item mapPair[K, V],
 		if len(n.items) == tr.max {
 			return tr.empty.value, false, true
 		}
-		n.items = append(n.items, tr.empty)
-		copy(n.items[i+1:], n.items[i:])
-		n.items[i] = item
+		tr.insertLeafItem(n, i, item)
 		n.count++
 		return tr.empty.value, false, false
 	}
@@ -397,7 +461,13 @@ func (tr *Map[K, V]) nodeSet(pn **mapNode[K, V], item mapPair[K, V],
 			return tr.empty.value, false, true
 		}
 		left := (*n.children)[i]
-		right, median := tr.nodeSplitForInsert(left, item.key)
+		var right *mapNode[K, V]
+		var median mapPair[K, V]
+		if left.leaf() {
+			right, median = tr.nodeSplitLeafWithInsert(left, item)
+		} else {
+			right, median = tr.nodeSplitForInsert(left, item.key)
+		}
 		*n.children = append(*n.children, nil)
 		copy((*n.children)[i+1:], (*n.children)[i:])
 		(*n.children)[i+1] = right
@@ -405,16 +475,8 @@ func (tr *Map[K, V]) nodeSet(pn **mapNode[K, V], item mapPair[K, V],
 		copy(n.items[i+1:], n.items[i:])
 		n.items[i] = median
 		if left.leaf() {
-			target := i
-			if !(item.key < median.key) {
-				target = i + 1
-			}
-			prev, replaced, split = tr.nodeSet(&(*n.children)[target], item)
-			if split {
-				return tr.empty.value, false, true
-			}
 			n.updateCount()
-			return prev, replaced, false
+			return tr.empty.value, false, false
 		}
 		return tr.nodeSet(&n, item)
 	}
@@ -834,7 +896,7 @@ func (tr *Map[K, V]) Load(key K, value V) (V, bool) {
 func (tr *Map[K, V]) loadAppend(item mapPair[K, V]) (V, bool) {
 	if len(tr.root.items) == tr.max {
 		left := tr.root
-		right, median := tr.nodeSplitForInsert(left, item.key)
+		right, median := tr.nodeSplitForAppend(left)
 		tr.root = tr.newNode(false)
 		*tr.root.children = append((*tr.root.children)[:0], left, right)
 		tr.root.items = append(tr.root.items[:0], median)
@@ -851,7 +913,7 @@ func (tr *Map[K, V]) loadAppend(item mapPair[K, V]) (V, bool) {
 		childIdx := len(*n.children) - 1
 		child := tr.isoLoad(&(*n.children)[childIdx], true)
 		if len(child.items) == tr.max {
-			right, median := tr.nodeSplitForInsert(child, item.key)
+			right, median := tr.nodeSplitForAppend(child)
 			n.items = append(n.items, median)
 			*n.children = append(*n.children, right)
 			childIdx = len(*n.children) - 1
