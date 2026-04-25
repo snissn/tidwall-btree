@@ -43,6 +43,8 @@ func benchmarkMapMemtableSet(b *testing.B, order []int) {
 	opts := MapOptions{
 		ReuseRightSplitCapacity:  true,
 		ReuseSplitInsertCapacity: true,
+		LeafItemArena:            true,
+		NodeArena:                true,
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -78,6 +80,8 @@ func BenchmarkMapMemtableLoadAppend(b *testing.B) {
 	opts := MapOptions{
 		ReuseRightSplitCapacity:  true,
 		ReuseSplitInsertCapacity: true,
+		LeafItemArena:            true,
+		NodeArena:                true,
 	}
 	b.ReportAllocs()
 	b.ResetTimer()

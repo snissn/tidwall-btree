@@ -5,6 +5,13 @@ package btree
 
 import "sync/atomic"
 
+const (
+	defaultMapLeafItemArenaChunkPairs = 1024
+	defaultMapNodeArenaChunkNodes     = 1024
+	defaultMapLeafItemArenaRetain     = 256
+	defaultMapNodeArenaRetain         = 256
+)
+
 type ordered interface {
 	~int | ~int8 | ~int16 | ~int32 | ~int64 |
 		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr |
@@ -57,9 +64,21 @@ type Map[K ordered, V any] struct {
 	reuseRightSplitCapacity      bool
 	reuseSplitInsertCapacity     bool
 	reuseBothSplitInsertCapacity bool
+	leafItemArena                bool
+	leafItemArenaChunkPairs      int
+	leafItemArenaRetainChunks    int
+	nodeArena                    bool
+	nodeArenaChunkNodes          int
+	nodeArenaRetainChunks        int
 	maxReuseNodes                int
 	freeLeaves                   []*mapNode[K, V]
 	freeBranches                 []*mapNode[K, V]
+	leafItemChunks               [][]mapPair[K, V]
+	leafItemChunkIndex           int
+	leafItemChunkOffset          int
+	nodeChunks                   [][]mapNode[K, V]
+	nodeChunkIndex               int
+	nodeChunkOffset              int
 }
 
 func NewMap[K ordered, V any](degree int) *Map[K, V] {
@@ -87,6 +106,26 @@ type MapOptions struct {
 	// allocations for non-append-heavy insert streams, at the cost of retaining
 	// more leaf capacity per split.
 	ReuseBothSplitInsertCapacity bool
+	// LeafItemArena allocates copied leaf item slices from reusable chunks
+	// instead of one heap object per leaf split. It is intended for
+	// short-lived write-heavy maps such as memtables.
+	LeafItemArena bool
+	// LeafItemArenaChunkPairs controls the number of item slots per arena chunk.
+	// Values less than or equal to zero use a conservative default.
+	LeafItemArenaChunkPairs int
+	// LeafItemArenaRetainChunks bounds how many leaf item arena chunks Clear
+	// keeps for reuse. Zero uses a conservative default; negative retains all.
+	LeafItemArenaRetainChunks int
+	// NodeArena allocates map nodes from reusable chunks instead of one heap
+	// object per split. It is intended for short-lived write-heavy maps such as
+	// memtables.
+	NodeArena bool
+	// NodeArenaChunkNodes controls the number of nodes per arena chunk. Values
+	// less than or equal to zero use a conservative default.
+	NodeArenaChunkNodes int
+	// NodeArenaRetainChunks bounds how many node arena chunks Clear keeps for
+	// reuse. Zero uses a conservative default; negative retains all.
+	NodeArenaRetainChunks int
 	// MaxReuseNodes bounds retained nodes when ReuseNodes is enabled. Values
 	// less than or equal to zero retain all owned nodes.
 	MaxReuseNodes int
@@ -98,6 +137,12 @@ func NewMapWithOptions[K ordered, V any](degree int, opts MapOptions) *Map[K, V]
 	m.reuseRightSplitCapacity = opts.ReuseRightSplitCapacity
 	m.reuseSplitInsertCapacity = opts.ReuseSplitInsertCapacity
 	m.reuseBothSplitInsertCapacity = opts.ReuseBothSplitInsertCapacity
+	m.leafItemArena = opts.LeafItemArena
+	m.leafItemArenaChunkPairs = opts.LeafItemArenaChunkPairs
+	m.leafItemArenaRetainChunks = opts.LeafItemArenaRetainChunks
+	m.nodeArena = opts.NodeArena
+	m.nodeArenaChunkNodes = opts.NodeArenaChunkNodes
+	m.nodeArenaRetainChunks = opts.NodeArenaRetainChunks
 	m.maxReuseNodes = opts.MaxReuseNodes
 	return m
 }
@@ -161,7 +206,20 @@ func (tr *Map[K, V]) IsoCopy() *Map[K, V] {
 	tr2.freeBranches = nil
 	tr2.isoid = newIsoID()
 	tr.isoid = newIsoID()
+	tr.detachArenasForIsoCopy()
+	tr2.detachArenasForIsoCopy()
 	return tr2
+}
+
+func (tr *Map[K, V]) detachArenasForIsoCopy() {
+	tr.leafItemArena = false
+	tr.leafItemChunks = nil
+	tr.leafItemChunkIndex = 0
+	tr.leafItemChunkOffset = 0
+	tr.nodeArena = false
+	tr.nodeChunks = nil
+	tr.nodeChunkIndex = 0
+	tr.nodeChunkOffset = 0
 }
 
 func (tr *Map[K, V]) newNode(leaf bool) *mapNode[K, V] {
@@ -194,8 +252,8 @@ func (tr *Map[K, V]) newNode(leaf bool) *mapNode[K, V] {
 			return n
 		}
 	}
-	n := new(mapNode[K, V])
-	n.isoid = tr.isoid
+	n := tr.newMapNode()
+	*n = mapNode[K, V]{isoid: tr.isoid}
 	if !leaf {
 		n.children = new([]*mapNode[K, V])
 	}
@@ -210,10 +268,115 @@ func (tr *Map[K, V]) canReuseNode() bool {
 	return tr.maxReuseNodes <= 0 || tr.reuseNodeCount() < tr.maxReuseNodes
 }
 
+func mapArenaRetainChunks(configured, def int) int {
+	if configured < 0 {
+		return -1
+	}
+	if configured == 0 {
+		return def
+	}
+	return configured
+}
+
 func (tr *Map[K, V]) zeroItems(items []mapPair[K, V]) {
 	for i := range items {
 		items[i] = tr.empty
 	}
+}
+
+func (tr *Map[K, V]) newMapNode() *mapNode[K, V] {
+	if !tr.nodeArena {
+		return new(mapNode[K, V])
+	}
+	chunkNodes := tr.nodeArenaChunkNodes
+	if chunkNodes <= 0 {
+		chunkNodes = defaultMapNodeArenaChunkNodes
+	}
+	for {
+		if tr.nodeChunkIndex < len(tr.nodeChunks) {
+			chunk := tr.nodeChunks[tr.nodeChunkIndex]
+			if tr.nodeChunkOffset < len(chunk) {
+				n := &chunk[tr.nodeChunkOffset]
+				tr.nodeChunkOffset++
+				return n
+			}
+			tr.nodeChunkIndex++
+			tr.nodeChunkOffset = 0
+			continue
+		}
+		tr.nodeChunks = append(tr.nodeChunks, make([]mapNode[K, V], chunkNodes))
+	}
+}
+
+func (tr *Map[K, V]) resetNodeArena() {
+	if !tr.nodeArena {
+		return
+	}
+	retain := mapArenaRetainChunks(tr.nodeArenaRetainChunks, defaultMapNodeArenaRetain)
+	for _, chunk := range tr.nodeChunks {
+		for i := range chunk {
+			chunk[i] = mapNode[K, V]{}
+		}
+	}
+	if retain >= 0 && len(tr.nodeChunks) > retain {
+		for i := retain; i < len(tr.nodeChunks); i++ {
+			tr.nodeChunks[i] = nil
+		}
+		tr.nodeChunks = tr.nodeChunks[:retain]
+	}
+	tr.nodeChunkIndex = 0
+	tr.nodeChunkOffset = 0
+}
+
+func (tr *Map[K, V]) newLeafItems(length, capacity int) []mapPair[K, V] {
+	if capacity < length {
+		capacity = length
+	}
+	if capacity <= 0 {
+		return nil
+	}
+	if !tr.leafItemArena {
+		return make([]mapPair[K, V], length, capacity)
+	}
+	chunkPairs := tr.leafItemArenaChunkPairs
+	if chunkPairs <= 0 {
+		chunkPairs = defaultMapLeafItemArenaChunkPairs
+	}
+	if capacity > chunkPairs {
+		return make([]mapPair[K, V], length, capacity)
+	}
+	for {
+		if tr.leafItemChunkIndex < len(tr.leafItemChunks) {
+			chunk := tr.leafItemChunks[tr.leafItemChunkIndex]
+			if tr.leafItemChunkOffset+capacity <= len(chunk) {
+				start := tr.leafItemChunkOffset
+				tr.leafItemChunkOffset += capacity
+				return chunk[start : start+length : start+capacity]
+			}
+			tr.leafItemChunkIndex++
+			tr.leafItemChunkOffset = 0
+			continue
+		}
+		tr.leafItemChunks = append(tr.leafItemChunks, make([]mapPair[K, V], chunkPairs))
+	}
+}
+
+func (tr *Map[K, V]) resetLeafItemArena() {
+	if !tr.leafItemArena {
+		return
+	}
+	retain := mapArenaRetainChunks(tr.leafItemArenaRetainChunks, defaultMapLeafItemArenaRetain)
+	for _, chunk := range tr.leafItemChunks {
+		tr.zeroItems(chunk)
+	}
+	if retain >= 0 && len(tr.leafItemChunks) > retain {
+		for i := retain; i < len(tr.leafItemChunks); i++ {
+			tr.leafItemChunks[i] = nil
+		}
+		tr.leafItemChunks = tr.leafItemChunks[:retain]
+	}
+	tr.leafItemChunkIndex = 0
+	tr.leafItemChunkOffset = 0
 }
 
 func (tr *Map[K, V]) zeroChildren(children []*mapNode[K, V]) {
@@ -223,11 +386,14 @@ func (tr *Map[K, V]) zeroChildren(children []*mapNode[K, V]) {
 }
 
 func (tr *Map[K, V]) recycleNode(n *mapNode[K, V]) {
-	if n == nil || !tr.reuseNodes || n.isoid != tr.isoid {
+	if n == nil || !tr.reuseNodes || n.isoid != tr.isoid || !tr.canReuseNode() {
 		return
 	}
 	if !n.leaf() {
 		for _, child := range *n.children {
+			if !tr.canReuseNode() {
+				break
+			}
 			tr.recycleNode(child)
 		}
 	}
@@ -367,7 +533,7 @@ func (tr *Map[K, V]) nodeSplitPreserveRight(n, right *mapNode[K, V], i int,
 	median mapPair[K, V],
 ) (*mapNode[K, V], mapPair[K, V]) {
 	old := n.items
-	leftItems := make([]mapPair[K, V], i, i)
+	leftItems := tr.newLeafItems(i, i)
 	copy(leftItems, old[:i])
 	rightLen := len(old) - i - 1
 	copy(old[:rightLen], old[i+1:])
@@ -384,7 +550,7 @@ func (tr *Map[K, V]) nodeSplitPreserveLeft(n, right *mapNode[K, V], i int,
 ) (*mapNode[K, V], mapPair[K, V]) {
 	old := n.items
 	rightLen := len(old) - i - 1
-	rightItems := make([]mapPair[K, V], rightLen, rightLen)
+	rightItems := tr.newLeafItems(rightLen, rightLen)
 	copy(rightItems, old[i+1:])
 	tr.zeroItems(old[i:])
 	right.items = rightItems
@@ -413,7 +579,7 @@ func (tr *Map[K, V]) nodeSplitLeafWithInsert(n *mapNode[K, V], item mapPair[K, V
 		if tr.reuseBothSplitInsertCapacity {
 			rightCap = tr.max
 		}
-		rightItems := make([]mapPair[K, V], rightLen, rightCap)
+		rightItems := tr.newLeafItems(rightLen, rightCap)
 		copy(rightItems, old[mid+1:])
 		copy(old[i+1:leftLen], old[i:mid])
 		old[i] = item
@@ -430,7 +596,7 @@ func (tr *Map[K, V]) nodeSplitLeafWithInsert(n *mapNode[K, V], item mapPair[K, V
 	if tr.reuseBothSplitInsertCapacity {
 		leftCap = tr.max
 	}
-	leftItems := make([]mapPair[K, V], leftLen, leftCap)
+	leftItems := tr.newLeafItems(leftLen, leftCap)
 	copy(leftItems, old[:leftLen])
 	rightLen := total - mid - 1
 	prefix := i - mid - 1
@@ -926,6 +1092,12 @@ func (tr *Map[K, V]) loadAppend(item mapPair[K, V]) (V, bool) {
 	}
 	n := tr.isoLoad(&tr.root, true)
 	for {
+		if len(n.items) == tr.max {
+			// The top-down right-edge path should split before descending into a
+			// full node. Fall back to the general Set path rather than promoting
+			// into an already-full parent if that invariant is ever violated.
+			return tr.Set(item.key, item.value)
+		}
 		n.count++
 		if n.leaf() {
 			n.items = append(n.items, item)
@@ -1496,6 +1668,9 @@ func (tr *Map[K, V]) nodeKeyValues(cn **mapNode[K, V], keys []K, values []V,
 func (tr *Map[K, V]) Clear() {
 	if tr.reuseNodes {
 		tr.recycleNode(tr.root)
+	} else {
+		tr.resetLeafItemArena()
+		tr.resetNodeArena()
 	}
 	tr.count = 0
 	tr.root = nil
