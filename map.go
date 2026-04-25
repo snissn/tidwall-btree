@@ -3,7 +3,10 @@
 // license that can be found in the LICENSE file.
 package btree
 
-import "sync/atomic"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 const (
 	defaultMapLeafItemArenaChunkPairs = 1024
@@ -40,6 +43,10 @@ func degreeToMinMax(deg int) (min, max int) {
 }
 
 var gisoid uint64
+
+// IsoCopy updates the source map's copy-on-write metadata. Serialize that
+// metadata handoff so concurrent Copy calls do not race with each other.
+var isoCopyMu sync.Mutex
 
 func newIsoID() uint64 {
 	return atomic.AddUint64(&gisoid, 1)
@@ -221,6 +228,9 @@ func (tr *Map[K, V]) Copy() *Map[K, V] {
 }
 
 func (tr *Map[K, V]) IsoCopy() *Map[K, V] {
+	isoCopyMu.Lock()
+	defer isoCopyMu.Unlock()
+
 	tr2 := new(Map[K, V])
 	*tr2 = *tr
 	tr2.freeLeaves = nil
