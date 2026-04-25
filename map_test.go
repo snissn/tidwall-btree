@@ -980,7 +980,7 @@ func (tr *Map[K, V]) deepcount() int {
 }
 
 func (n *mapNode[K, V]) deepcount() int {
-	count := len(n.items)
+	count := n.itemLen()
 	if !n.leaf() {
 		for i := 0; i <= len(n.items); i++ {
 			count += (*n.children)[i].deepcount()
@@ -993,13 +993,14 @@ func (n *mapNode[K, V]) deepcount() int {
 }
 
 func (tr *Map[K, V]) nodesaneprops(n *mapNode[K, V], height int) bool {
+	itemLen := n.itemLen()
 	if height == 1 {
-		if len(n.items) < 1 || len(n.items) > tr.max {
-			println(len(n.items) < 1)
+		if itemLen < 1 || itemLen > tr.max {
+			println(itemLen < 1)
 			return false
 		}
 	} else {
-		if len(n.items) < tr.min || len(n.items) > tr.max {
+		if itemLen < tr.min || itemLen > tr.max {
 			println(2)
 			return false
 		}
@@ -1031,6 +1032,27 @@ func (tr *Map[K, V]) saneprops() bool {
 }
 
 func (tr *Map[K, V]) sanenilsnode(n *mapNode[K, V]) bool {
+	if n.leafSlotIndex() {
+		used := make([]bool, len(n.items))
+		for _, slot := range n.slots {
+			if int(slot) >= len(n.items) || used[slot] {
+				return false
+			}
+			used[slot] = true
+		}
+		for i, used := range used {
+			if !used && !tr.eq(n.items[i].key, tr.empty.key) {
+				return false
+			}
+		}
+		items := n.items[:cap(n.items):cap(n.items)]
+		for i := len(n.items); i < len(items); i++ {
+			if !tr.eq(items[i].key, tr.empty.key) {
+				return false
+			}
+		}
+		return true
+	}
 	items := n.items[:cap(n.items):cap(n.items)]
 	for i := len(n.items); i < len(items); i++ {
 		if !tr.eq(items[i].key, tr.empty.key) {
@@ -1655,6 +1677,164 @@ func TestMapLoadAppendSplitsFullRightEdge(t *testing.T) {
 	}
 	if got, _, ok := m.Max(); !ok || got != 127 {
 		t.Fatalf("Max()=(%d,_,%t), want (127,_,true)", got, ok)
+	}
+	if err := m.Sane(); err != nil {
+		t.Fatalf("Sane() error: %v", err)
+	}
+}
+
+func TestMapLoadSortedDenseRightEdgeSplits(t *testing.T) {
+	const count = 256
+	m := NewMapWithOptions[int, int](4, MapOptions{
+		ReuseRightSplitCapacity:  true,
+		ReuseSplitInsertCapacity: true,
+		LeafItemArena:            true,
+		NodeArena:                true,
+	})
+	if ok := m.LoadSorted(count, func(i int) int {
+		return i
+	}, func(i int) int {
+		return i * 10
+	}); !ok {
+		t.Fatal("LoadSorted rejected strictly increasing run")
+	}
+	if got := m.Len(); got != count {
+		t.Fatalf("Len()=%d want %d", got, count)
+	}
+	for i := 0; i < count; i++ {
+		if got, ok := m.Get(i); !ok || got != i*10 {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", i, got, ok, i*10)
+		}
+	}
+	if err := m.Sane(); err != nil {
+		t.Fatalf("Sane() error: %v", err)
+	}
+
+	var leafLens []int
+	var walk func(n *mapNode[int, int])
+	walk = func(n *mapNode[int, int]) {
+		if n.leaf() {
+			leafLens = append(leafLens, len(n.items))
+			return
+		}
+		for _, child := range *n.children {
+			walk(child)
+		}
+	}
+	walk(m.root)
+	if len(leafLens) < 2 {
+		t.Fatalf("leaf count=%d want >= 2", len(leafLens))
+	}
+	for i, got := range leafLens[:len(leafLens)-1] {
+		if got < m.max-1 {
+			t.Fatalf("leaf %d len=%d want >= %d; all leaf lens=%v", i, got, m.max-1, leafLens)
+		}
+	}
+}
+
+func TestMapLoadSortedRejectsWithoutValueOwnershipWork(t *testing.T) {
+	m := NewMap[int, int](4)
+	if ok := m.LoadSorted(3, func(i int) int {
+		return []int{1, 1, 2}[i]
+	}, func(i int) int {
+		t.Fatalf("valueAt(%d) called for invalid run", i)
+		return 0
+	}); ok {
+		t.Fatal("LoadSorted accepted duplicate keys")
+	}
+	if got := m.Len(); got != 0 {
+		t.Fatalf("Len()=%d want 0", got)
+	}
+
+	if ok := m.LoadSorted(3, func(i int) int { return i }, func(i int) int { return i }); !ok {
+		t.Fatal("LoadSorted rejected setup run")
+	}
+	if ok := m.LoadSorted(2, func(i int) int {
+		return []int{2, 4}[i]
+	}, func(i int) int {
+		t.Fatalf("valueAt(%d) called for overlapping run", i)
+		return 0
+	}); ok {
+		t.Fatal("LoadSorted accepted overlapping keys")
+	}
+	if got := m.Len(); got != 3 {
+		t.Fatalf("Len()=%d want 3", got)
+	}
+}
+
+func TestMapLeafSlotIndexRandomInsertAndIter(t *testing.T) {
+	const count = 1024
+	m := NewMapWithOptions[int, int](4, MapOptions{
+		ReuseRightSplitCapacity:  true,
+		ReuseSplitInsertCapacity: true,
+		LeafSlotIndex:            true,
+		LeafItemArena:            true,
+		NodeArena:                true,
+	})
+	order := make([]int, count)
+	for i := range order {
+		order[i] = i
+	}
+	var x uint64 = 0x9e3779b97f4a7c15
+	for i := count - 1; i > 0; i-- {
+		x ^= x << 7
+		x ^= x >> 9
+		j := int(x % uint64(i+1))
+		order[i], order[j] = order[j], order[i]
+	}
+	for _, key := range order {
+		if _, replaced := m.Set(key, key*10); replaced {
+			t.Fatalf("Set(%d) replaced existing key", key)
+		}
+	}
+	if got := m.Len(); got != count {
+		t.Fatalf("Len()=%d want %d", got, count)
+	}
+	for i := 0; i < count; i++ {
+		if got, ok := m.Get(i); !ok || got != i*10 {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", i, got, ok, i*10)
+		}
+	}
+	iter := m.Iter()
+	for i := 0; i < count; i++ {
+		if !iter.Next() {
+			t.Fatalf("iterator ended at %d", i)
+		}
+		if got := iter.Key(); got != i {
+			t.Fatalf("iter key=%d want %d", got, i)
+		}
+		if got := iter.Value(); got != i*10 {
+			t.Fatalf("iter value=%d want %d", got, i*10)
+		}
+	}
+	if iter.Next() {
+		t.Fatal("iterator produced extra item")
+	}
+	if err := m.Sane(); err != nil {
+		t.Fatalf("Sane() error: %v", err)
+	}
+}
+
+func TestMapLeafSlotIndexLoadSorted(t *testing.T) {
+	const count = 512
+	m := NewMapWithOptions[int, int](4, MapOptions{
+		ReuseRightSplitCapacity:  true,
+		ReuseSplitInsertCapacity: true,
+		LeafSlotIndex:            true,
+		LeafItemArena:            true,
+		NodeArena:                true,
+	})
+	if ok := m.LoadSorted(count, func(i int) int {
+		return i
+	}, func(i int) int {
+		return i * 11
+	}); !ok {
+		t.Fatal("LoadSorted rejected strictly increasing run")
+	}
+	for i := 0; i < count; i++ {
+		if got, ok := m.Get(i); !ok || got != i*11 {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", i, got, ok, i*11)
+		}
 	}
 	if err := m.Sane(); err != nil {
 		t.Fatalf("Sane() error: %v", err)

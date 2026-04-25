@@ -37,19 +37,13 @@ func memtableBenchRandomOrder(n int) []int {
 	return order
 }
 
-func benchmarkMapMemtableSet(b *testing.B, order []int) {
+func benchmarkMapMemtableSetWithDegreeOptions(b *testing.B, order []int, degree int, opts MapOptions) {
 	keys := memtableBenchKeys(len(order))
 	value := memtableBenchValue{value: []byte("value")}
-	opts := MapOptions{
-		ReuseRightSplitCapacity:  true,
-		ReuseSplitInsertCapacity: true,
-		LeafItemArena:            true,
-		NodeArena:                true,
-	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		m := NewMapWithOptions[string, memtableBenchValue](32, opts)
+		m := NewMapWithOptions[string, memtableBenchValue](degree, opts)
 		for _, idx := range order {
 			m.Set(keys[idx], value)
 		}
@@ -57,9 +51,79 @@ func benchmarkMapMemtableSet(b *testing.B, order []int) {
 	}
 }
 
+func benchmarkMapMemtableSetWithOptions(b *testing.B, order []int, opts MapOptions) {
+	benchmarkMapMemtableSetWithDegreeOptions(b, order, 32, opts)
+}
+
+func benchmarkMapMemtableSet(b *testing.B, order []int) {
+	benchmarkMapMemtableSetWithOptions(b, order, MapOptions{
+		ReuseRightSplitCapacity:  true,
+		ReuseSplitInsertCapacity: true,
+		LeafItemArena:            true,
+		NodeArena:                true,
+	})
+}
+
 func BenchmarkMapMemtableSetRandom(b *testing.B) {
 	const n = 65536
 	benchmarkMapMemtableSet(b, memtableBenchRandomOrder(n))
+}
+
+func BenchmarkMapMemtableSetRandomNoSplitReuse(b *testing.B) {
+	const n = 65536
+	benchmarkMapMemtableSetWithOptions(b, memtableBenchRandomOrder(n), MapOptions{
+		LeafItemArena: true,
+		NodeArena:     true,
+	})
+}
+
+func BenchmarkMapMemtableSetRandomNoRightReuse(b *testing.B) {
+	const n = 65536
+	benchmarkMapMemtableSetWithOptions(b, memtableBenchRandomOrder(n), MapOptions{
+		ReuseSplitInsertCapacity: true,
+		LeafItemArena:            true,
+		NodeArena:                true,
+	})
+}
+
+func BenchmarkMapMemtableSetRandomNoInsertReuse(b *testing.B) {
+	const n = 65536
+	benchmarkMapMemtableSetWithOptions(b, memtableBenchRandomOrder(n), MapOptions{
+		ReuseRightSplitCapacity: true,
+		LeafItemArena:           true,
+		NodeArena:               true,
+	})
+}
+
+func BenchmarkMapMemtableSetRandomDegree64(b *testing.B) {
+	const n = 65536
+	benchmarkMapMemtableSetWithDegreeOptions(b, memtableBenchRandomOrder(n), 64, MapOptions{
+		ReuseRightSplitCapacity:  true,
+		ReuseSplitInsertCapacity: true,
+		LeafItemArena:            true,
+		NodeArena:                true,
+	})
+}
+
+func BenchmarkMapMemtableSetRandomDegree128(b *testing.B) {
+	const n = 65536
+	benchmarkMapMemtableSetWithDegreeOptions(b, memtableBenchRandomOrder(n), 128, MapOptions{
+		ReuseRightSplitCapacity:  true,
+		ReuseSplitInsertCapacity: true,
+		LeafItemArena:            true,
+		NodeArena:                true,
+	})
+}
+
+func BenchmarkMapMemtableSetRandomLeafSlots(b *testing.B) {
+	const n = 65536
+	benchmarkMapMemtableSetWithDegreeOptions(b, memtableBenchRandomOrder(n), 32, MapOptions{
+		ReuseRightSplitCapacity:  true,
+		ReuseSplitInsertCapacity: true,
+		LeafSlotIndex:            true,
+		LeafItemArena:            true,
+		NodeArena:                true,
+	})
 }
 
 func BenchmarkMapMemtableSetMixedAppendRandom(b *testing.B) {
@@ -71,6 +135,23 @@ func BenchmarkMapMemtableSetMixedAppendRandom(b *testing.B) {
 		mixed = append(mixed, order[i])
 	}
 	benchmarkMapMemtableSet(b, mixed)
+}
+
+func BenchmarkMapMemtableSetMixedAppendRandomLeafSlots(b *testing.B) {
+	const n = 65536
+	order := memtableBenchRandomOrder(n / 2)
+	mixed := make([]int, 0, n)
+	for i := 0; i < n/2; i++ {
+		mixed = append(mixed, i+n/2)
+		mixed = append(mixed, order[i])
+	}
+	benchmarkMapMemtableSetWithDegreeOptions(b, mixed, 32, MapOptions{
+		ReuseRightSplitCapacity:  true,
+		ReuseSplitInsertCapacity: true,
+		LeafSlotIndex:            true,
+		LeafItemArena:            true,
+		NodeArena:                true,
+	})
 }
 
 func BenchmarkMapMemtableLoadAppend(b *testing.B) {
@@ -90,6 +171,51 @@ func BenchmarkMapMemtableLoadAppend(b *testing.B) {
 		for _, key := range keys {
 			m.Load(key, value)
 		}
+		memtableBenchSink += m.Len()
+	}
+}
+
+func BenchmarkMapMemtableLoadAppendLeafSlots(b *testing.B) {
+	const n = 65536
+	keys := memtableBenchKeys(n)
+	value := memtableBenchValue{value: []byte("value")}
+	opts := MapOptions{
+		ReuseRightSplitCapacity:  true,
+		ReuseSplitInsertCapacity: true,
+		LeafSlotIndex:            true,
+		LeafItemArena:            true,
+		NodeArena:                true,
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m := NewMapWithOptions[string, memtableBenchValue](32, opts)
+		for _, key := range keys {
+			m.Load(key, value)
+		}
+		memtableBenchSink += m.Len()
+	}
+}
+
+func BenchmarkMapMemtableLoadSorted(b *testing.B) {
+	const n = 65536
+	keys := memtableBenchKeys(n)
+	value := memtableBenchValue{value: []byte("value")}
+	opts := MapOptions{
+		ReuseRightSplitCapacity:  true,
+		ReuseSplitInsertCapacity: true,
+		LeafItemArena:            true,
+		NodeArena:                true,
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m := NewMapWithOptions[string, memtableBenchValue](32, opts)
+		m.LoadSorted(n, func(i int) string {
+			return keys[i]
+		}, func(i int) memtableBenchValue {
+			return value
+		})
 		memtableBenchSink += m.Len()
 	}
 }
