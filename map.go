@@ -1092,6 +1092,12 @@ func (tr *Map[K, V]) loadAppend(item mapPair[K, V]) (V, bool) {
 	}
 	n := tr.isoLoad(&tr.root, true)
 	for {
+		if len(n.items) == tr.max {
+			// The top-down right-edge path should split before descending into a
+			// full node. Fall back to the general Set path rather than promoting
+			// into an already-full parent if that invariant is ever violated.
+			return tr.Set(item.key, item.value)
+		}
 		n.count++
 		if n.leaf() {
 			n.items = append(n.items, item)
