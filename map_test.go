@@ -1325,12 +1325,12 @@ func TestMapClearReuseReusesOwnedNodes(t *testing.T) {
 	if m.Len() != 0 {
 		t.Fatalf("Len()=%d, want 0", m.Len())
 	}
-	reused := len(m.freeLeaves) + len(m.freeBranches)
+	reused := m.reuseNodeCount()
 	if reused == 0 {
 		t.Fatal("expected Clear to retain reusable nodes")
 	}
 	m.Set(1, 10)
-	if got := len(m.freeLeaves) + len(m.freeBranches); got >= reused {
+	if got := m.reuseNodeCount(); got >= reused {
 		t.Fatalf("reusable nodes did not decrease after Set: before=%d after=%d", reused, got)
 	}
 	if v, ok := m.Get(1); !ok || v != 10 {
@@ -1345,7 +1345,7 @@ func TestMapClearReuseDoesNotRecycleSharedCopyNodes(t *testing.T) {
 	}
 	cp := m.Copy()
 	m.Clear()
-	if got := len(m.freeLeaves) + len(m.freeBranches); got != 0 {
+	if got := m.reuseNodeCount(); got != 0 {
 		t.Fatalf("reused shared nodes=%d, want 0", got)
 	}
 	for i := 0; i < 1000; i++ {
@@ -1369,7 +1369,7 @@ func TestMapClearReuseHonorsMaxReuseNodes(t *testing.T) {
 		m.Set(i, i)
 	}
 	m.Clear()
-	if got := len(m.freeLeaves) + len(m.freeBranches); got != maxReuse {
+	if got := m.reuseNodeCount(); got != maxReuse {
 		t.Fatalf("retained nodes=%d, want %d", got, maxReuse)
 	}
 }
@@ -1655,6 +1655,66 @@ func TestMapLoadAppendSplitsFullRightEdge(t *testing.T) {
 	}
 	if got, _, ok := m.Max(); !ok || got != 127 {
 		t.Fatalf("Max()=(%d,_,%t), want (127,_,true)", got, ok)
+	}
+	if err := m.Sane(); err != nil {
+		t.Fatalf("Sane() error: %v", err)
+	}
+}
+
+func TestMapLeafItemArenaClearCapsRetainedChunks(t *testing.T) {
+	const retain = 2
+	m := NewMapWithOptions[int, int](4, MapOptions{
+		ReuseSplitInsertCapacity:     true,
+		LeafItemArena:                true,
+		LeafItemArenaChunkPairs:      32,
+		LeafItemArenaRetainChunks:    retain,
+		ReuseBothSplitInsertCapacity: true,
+	})
+	for i := 0; i < 1024; i++ {
+		m.Set((i*37)%1031, i)
+	}
+	if chunks := len(m.leafItemChunks); chunks <= retain {
+		t.Fatalf("leaf item chunks before Clear=%d want > %d", chunks, retain)
+	}
+	m.Clear()
+	if got := len(m.leafItemChunks); got != retain {
+		t.Fatalf("leaf item chunks after Clear=%d want %d", got, retain)
+	}
+	for i := 0; i < 128; i++ {
+		m.Set(i, i)
+	}
+	for i := 0; i < 128; i++ {
+		if got, ok := m.Get(i); !ok || got != i {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", i, got, ok, i)
+		}
+	}
+}
+
+func TestMapNodeArenaClearCapsRetainedChunks(t *testing.T) {
+	const retain = 2
+	m := NewMapWithOptions[int, int](4, MapOptions{
+		ReuseSplitInsertCapacity: true,
+		NodeArena:                true,
+		NodeArenaChunkNodes:      4,
+		NodeArenaRetainChunks:    retain,
+	})
+	for i := 0; i < 256; i++ {
+		m.Set((i*41)%263, i)
+	}
+	if chunks := len(m.nodeChunks); chunks <= retain {
+		t.Fatalf("node chunks before Clear=%d want > %d", chunks, retain)
+	}
+	m.Clear()
+	if got := len(m.nodeChunks); got != retain {
+		t.Fatalf("node chunks after Clear=%d want %d", got, retain)
+	}
+	for i := 0; i < 128; i++ {
+		m.Set(i, i)
+	}
+	for i := 0; i < 128; i++ {
+		if got, ok := m.Get(i); !ok || got != i {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", i, got, ok, i)
+		}
 	}
 }
 

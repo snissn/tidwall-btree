@@ -8,6 +8,8 @@ import "sync/atomic"
 const (
 	defaultMapLeafItemArenaChunkPairs = 1024
 	defaultMapNodeArenaChunkNodes     = 1024
+	defaultMapLeafItemArenaRetain     = 256
+	defaultMapNodeArenaRetain         = 256
 )
 
 type ordered interface {
@@ -64,8 +66,10 @@ type Map[K ordered, V any] struct {
 	reuseBothSplitInsertCapacity bool
 	leafItemArena                bool
 	leafItemArenaChunkPairs      int
+	leafItemArenaRetainChunks    int
 	nodeArena                    bool
 	nodeArenaChunkNodes          int
+	nodeArenaRetainChunks        int
 	maxReuseNodes                int
 	freeLeaves                   []*mapNode[K, V]
 	freeBranches                 []*mapNode[K, V]
@@ -109,6 +113,9 @@ type MapOptions struct {
 	// LeafItemArenaChunkPairs controls the number of item slots per arena chunk.
 	// Values less than or equal to zero use a conservative default.
 	LeafItemArenaChunkPairs int
+	// LeafItemArenaRetainChunks bounds how many leaf item arena chunks Clear
+	// keeps for reuse. Zero uses a conservative default; negative retains all.
+	LeafItemArenaRetainChunks int
 	// NodeArena allocates map nodes from reusable chunks instead of one heap
 	// object per split. It is intended for short-lived write-heavy maps such as
 	// memtables.
@@ -116,6 +123,9 @@ type MapOptions struct {
 	// NodeArenaChunkNodes controls the number of nodes per arena chunk. Values
 	// less than or equal to zero use a conservative default.
 	NodeArenaChunkNodes int
+	// NodeArenaRetainChunks bounds how many node arena chunks Clear keeps for
+	// reuse. Zero uses a conservative default; negative retains all.
+	NodeArenaRetainChunks int
 	// MaxReuseNodes bounds retained nodes when ReuseNodes is enabled. Values
 	// less than or equal to zero retain all owned nodes.
 	MaxReuseNodes int
@@ -129,8 +139,10 @@ func NewMapWithOptions[K ordered, V any](degree int, opts MapOptions) *Map[K, V]
 	m.reuseBothSplitInsertCapacity = opts.ReuseBothSplitInsertCapacity
 	m.leafItemArena = opts.LeafItemArena
 	m.leafItemArenaChunkPairs = opts.LeafItemArenaChunkPairs
+	m.leafItemArenaRetainChunks = opts.LeafItemArenaRetainChunks
 	m.nodeArena = opts.NodeArena
 	m.nodeArenaChunkNodes = opts.NodeArenaChunkNodes
+	m.nodeArenaRetainChunks = opts.NodeArenaRetainChunks
 	m.maxReuseNodes = opts.MaxReuseNodes
 	return m
 }
@@ -256,6 +268,16 @@ func (tr *Map[K, V]) canReuseNode() bool {
 	return tr.maxReuseNodes <= 0 || tr.reuseNodeCount() < tr.maxReuseNodes
 }
 
+func mapArenaRetainChunks(configured, def int) int {
+	if configured < 0 {
+		return -1
+	}
+	if configured == 0 {
+		return def
+	}
+	return configured
+}
+
 func (tr *Map[K, V]) zeroItems(items []mapPair[K, V]) {
 	for i := range items {
 		items[i] = tr.empty
@@ -290,10 +312,17 @@ func (tr *Map[K, V]) resetNodeArena() {
 	if !tr.nodeArena {
 		return
 	}
+	retain := mapArenaRetainChunks(tr.nodeArenaRetainChunks, defaultMapNodeArenaRetain)
 	for _, chunk := range tr.nodeChunks {
 		for i := range chunk {
 			chunk[i] = mapNode[K, V]{}
 		}
+	}
+	if retain >= 0 && len(tr.nodeChunks) > retain {
+		for i := retain; i < len(tr.nodeChunks); i++ {
+			tr.nodeChunks[i] = nil
+		}
+		tr.nodeChunks = tr.nodeChunks[:retain]
 	}
 	tr.nodeChunkIndex = 0
 	tr.nodeChunkOffset = 0
@@ -336,8 +365,15 @@ func (tr *Map[K, V]) resetLeafItemArena() {
 	if !tr.leafItemArena {
 		return
 	}
+	retain := mapArenaRetainChunks(tr.leafItemArenaRetainChunks, defaultMapLeafItemArenaRetain)
 	for _, chunk := range tr.leafItemChunks {
 		tr.zeroItems(chunk)
+	}
+	if retain >= 0 && len(tr.leafItemChunks) > retain {
+		for i := retain; i < len(tr.leafItemChunks); i++ {
+			tr.leafItemChunks[i] = nil
+		}
+		tr.leafItemChunks = tr.leafItemChunks[:retain]
 	}
 	tr.leafItemChunkIndex = 0
 	tr.leafItemChunkOffset = 0
@@ -350,11 +386,14 @@ func (tr *Map[K, V]) zeroChildren(children []*mapNode[K, V]) {
 }
 
 func (tr *Map[K, V]) recycleNode(n *mapNode[K, V]) {
-	if n == nil || !tr.reuseNodes || n.isoid != tr.isoid {
+	if n == nil || !tr.reuseNodes || n.isoid != tr.isoid || !tr.canReuseNode() {
 		return
 	}
 	if !n.leaf() {
 		for _, child := range *n.children {
+			if !tr.canReuseNode() {
+				break
+			}
 			tr.recycleNode(child)
 		}
 	}
