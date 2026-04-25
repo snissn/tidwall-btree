@@ -1316,6 +1316,208 @@ func TestMapCopy(t *testing.T) {
 	}
 }
 
+func TestMapClearReuseReusesOwnedNodes(t *testing.T) {
+	m := NewMapWithOptions[int, int](4, MapOptions{ReuseNodes: true})
+	for i := 0; i < 1000; i++ {
+		m.Set(i, i)
+	}
+	m.Clear()
+	if m.Len() != 0 {
+		t.Fatalf("Len()=%d, want 0", m.Len())
+	}
+	reused := len(m.freeLeaves) + len(m.freeBranches)
+	if reused == 0 {
+		t.Fatal("expected Clear to retain reusable nodes")
+	}
+	m.Set(1, 10)
+	if got := len(m.freeLeaves) + len(m.freeBranches); got >= reused {
+		t.Fatalf("reusable nodes did not decrease after Set: before=%d after=%d", reused, got)
+	}
+	if v, ok := m.Get(1); !ok || v != 10 {
+		t.Fatalf("Get(1)=(%d,%t), want (10,true)", v, ok)
+	}
+}
+
+func TestMapClearReuseDoesNotRecycleSharedCopyNodes(t *testing.T) {
+	m := NewMapWithOptions[int, int](4, MapOptions{ReuseNodes: true})
+	for i := 0; i < 1000; i++ {
+		m.Set(i, i)
+	}
+	cp := m.Copy()
+	m.Clear()
+	if got := len(m.freeLeaves) + len(m.freeBranches); got != 0 {
+		t.Fatalf("reused shared nodes=%d, want 0", got)
+	}
+	for i := 0; i < 1000; i++ {
+		if v, ok := cp.Get(i); !ok || v != i {
+			t.Fatalf("copy Get(%d)=(%d,%t), want (%d,true)", i, v, ok, i)
+		}
+	}
+	m.Set(2000, 2000)
+	if _, ok := cp.Get(2000); ok {
+		t.Fatal("copy observed post-clear insert")
+	}
+}
+
+func TestMapClearReuseHonorsMaxReuseNodes(t *testing.T) {
+	const maxReuse = 3
+	m := NewMapWithOptions[int, int](2, MapOptions{
+		ReuseNodes:    true,
+		MaxReuseNodes: maxReuse,
+	})
+	for i := 0; i < 1000; i++ {
+		m.Set(i, i)
+	}
+	m.Clear()
+	if got := len(m.freeLeaves) + len(m.freeBranches); got != maxReuse {
+		t.Fatalf("retained nodes=%d, want %d", got, maxReuse)
+	}
+}
+
+func TestMapReuseRightSplitCapacity(t *testing.T) {
+	m := NewMapWithOptions[int, int](4, MapOptions{ReuseRightSplitCapacity: true})
+	for i := 0; i < 8; i++ {
+		m.Load(i, i)
+	}
+	if m.root.leaf() {
+		t.Fatal("expected split root")
+	}
+	right := (*m.root.children)[1]
+	if got, want := len(right.items), 4; got != want {
+		t.Fatalf("right len=%d want %d", got, want)
+	}
+	if got, wantMin := cap(right.items), m.max; got < wantMin {
+		t.Fatalf("right cap=%d want >= %d", got, wantMin)
+	}
+	for i := 0; i < 8; i++ {
+		if v, ok := m.Get(i); !ok || v != i {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", i, v, ok, i)
+		}
+	}
+}
+
+func TestMapReuseSplitInsertCapacityPreservesLeftForLeftInsert(t *testing.T) {
+	m := NewMapWithOptions[int, int](4, MapOptions{ReuseSplitInsertCapacity: true})
+	for i := 0; i < m.max; i++ {
+		m.Load(i, i)
+	}
+	m.Set(-1, -1)
+	if m.root.leaf() {
+		t.Fatal("expected split root")
+	}
+	left := (*m.root.children)[0]
+	right := (*m.root.children)[1]
+	if got, wantMin := cap(left.items), m.max; got < wantMin {
+		t.Fatalf("left cap=%d want >= %d", got, wantMin)
+	}
+	if got, want := len(left.items), 4; got != want {
+		t.Fatalf("left len=%d want %d", got, want)
+	}
+	if got, want := len(right.items), 3; got != want {
+		t.Fatalf("right len=%d want %d", got, want)
+	}
+	for i := -1; i < m.max; i++ {
+		if v, ok := m.Get(i); !ok || v != i {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", i, v, ok, i)
+		}
+	}
+}
+
+func TestMapReuseSplitInsertCapacityPreservesRightForRightInsert(t *testing.T) {
+	m := NewMapWithOptions[int, int](4, MapOptions{ReuseSplitInsertCapacity: true})
+	for i := 0; i < m.max; i++ {
+		m.Load(i, i)
+	}
+	m.Set(m.max, m.max)
+	if m.root.leaf() {
+		t.Fatal("expected split root")
+	}
+	right := (*m.root.children)[1]
+	if got, wantMin := cap(right.items), m.max; got < wantMin {
+		t.Fatalf("right cap=%d want >= %d", got, wantMin)
+	}
+	if got, want := len(right.items), 4; got != want {
+		t.Fatalf("right len=%d want %d", got, want)
+	}
+	for i := 0; i <= m.max; i++ {
+		if v, ok := m.Get(i); !ok || v != i {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", i, v, ok, i)
+		}
+	}
+}
+
+func TestMapReuseBothSplitInsertCapacityPreservesSiblingForLeftInsert(t *testing.T) {
+	m := NewMapWithOptions[int, int](4, MapOptions{
+		ReuseSplitInsertCapacity:     true,
+		ReuseBothSplitInsertCapacity: true,
+	})
+	for i := 0; i < m.max; i++ {
+		m.Load(i, i)
+	}
+	m.Set(-1, -1)
+	if m.root.leaf() {
+		t.Fatal("expected split root")
+	}
+	left := (*m.root.children)[0]
+	right := (*m.root.children)[1]
+	if got, wantMin := cap(left.items), m.max; got < wantMin {
+		t.Fatalf("left cap=%d want >= %d", got, wantMin)
+	}
+	if got, wantMin := cap(right.items), m.max; got < wantMin {
+		t.Fatalf("right cap=%d want >= %d", got, wantMin)
+	}
+	for i := -1; i < m.max; i++ {
+		if v, ok := m.Get(i); !ok || v != i {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", i, v, ok, i)
+		}
+	}
+}
+
+func TestMapSetReuseBothSplitInsertCapacity(t *testing.T) {
+	m := NewMapWithOptions[int, int](4, MapOptions{ReuseSplitInsertCapacity: true})
+	m.SetReuseBothSplitInsertCapacity(true)
+	for i := 0; i < m.max; i++ {
+		m.Load(i, i)
+	}
+	m.Set(m.max, m.max)
+	if m.root.leaf() {
+		t.Fatal("expected split root")
+	}
+	left := (*m.root.children)[0]
+	right := (*m.root.children)[1]
+	if got, wantMin := cap(left.items), m.max; got < wantMin {
+		t.Fatalf("left cap=%d want >= %d", got, wantMin)
+	}
+	if got, wantMin := cap(right.items), m.max; got < wantMin {
+		t.Fatalf("right cap=%d want >= %d", got, wantMin)
+	}
+	for i := 0; i <= m.max; i++ {
+		if v, ok := m.Get(i); !ok || v != i {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", i, v, ok, i)
+		}
+	}
+}
+
+func TestMapLoadAppendSplitsFullRightEdge(t *testing.T) {
+	m := NewMapWithOptions[int, int](2, MapOptions{ReuseSplitInsertCapacity: true})
+	for i := 0; i < 128; i++ {
+		if _, replaced := m.Load(i, i); replaced {
+			t.Fatalf("Load(%d) replaced existing item", i)
+		}
+	}
+	if got, want := m.Len(), 128; got != want {
+		t.Fatalf("Len()=%d want %d", got, want)
+	}
+	for i := 0; i < 128; i++ {
+		if v, ok := m.Get(i); !ok || v != i {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", i, v, ok, i)
+		}
+	}
+	if got, _, ok := m.Max(); !ok || got != 127 {
+		t.Fatalf("Max()=(%d,_,%t), want (127,_,true)", got, ok)
+	}
+}
+
 type testNonCopyItem struct {
 	data string
 }

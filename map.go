@@ -45,20 +45,68 @@ type mapPair[K ordered, V any] struct {
 }
 
 type Map[K ordered, V any] struct {
-	isoid         uint64
-	root          *mapNode[K, V]
-	count         int
-	empty         mapPair[K, V]
-	min           int // min items
-	max           int // max items
-	copyValues    bool
-	isoCopyValues bool
+	isoid                        uint64
+	root                         *mapNode[K, V]
+	count                        int
+	empty                        mapPair[K, V]
+	min                          int // min items
+	max                          int // max items
+	copyValues                   bool
+	isoCopyValues                bool
+	reuseNodes                   bool
+	reuseRightSplitCapacity      bool
+	reuseSplitInsertCapacity     bool
+	reuseBothSplitInsertCapacity bool
+	maxReuseNodes                int
+	freeLeaves                   []*mapNode[K, V]
+	freeBranches                 []*mapNode[K, V]
 }
 
 func NewMap[K ordered, V any](degree int) *Map[K, V] {
 	m := new(Map[K, V])
 	m.init(degree)
 	return m
+}
+
+// MapOptions configures optional Map behavior.
+type MapOptions struct {
+	// ReuseNodes makes Clear retain owned tree nodes for later inserts. It is
+	// useful for short-lived maps with repeated clear/refill cycles.
+	ReuseNodes bool
+	// ReuseRightSplitCapacity makes leaf splits copy the left half so the right
+	// half keeps the original backing capacity. It is intended for monotonic
+	// Load-heavy workloads where the right side is likely to receive more
+	// appends soon after the split.
+	ReuseRightSplitCapacity bool
+	// ReuseSplitInsertCapacity makes leaf splits preserve backing capacity on
+	// the side that will receive the pending insert. This avoids the immediate
+	// post-split append allocation for mixed insert workloads.
+	ReuseSplitInsertCapacity bool
+	// ReuseBothSplitInsertCapacity also gives the split sibling full leaf
+	// capacity during a split-with-insert. This reduces future growth
+	// allocations for non-append-heavy insert streams, at the cost of retaining
+	// more leaf capacity per split.
+	ReuseBothSplitInsertCapacity bool
+	// MaxReuseNodes bounds retained nodes when ReuseNodes is enabled. Values
+	// less than or equal to zero retain all owned nodes.
+	MaxReuseNodes int
+}
+
+func NewMapWithOptions[K ordered, V any](degree int, opts MapOptions) *Map[K, V] {
+	m := NewMap[K, V](degree)
+	m.reuseNodes = opts.ReuseNodes
+	m.reuseRightSplitCapacity = opts.ReuseRightSplitCapacity
+	m.reuseSplitInsertCapacity = opts.ReuseSplitInsertCapacity
+	m.reuseBothSplitInsertCapacity = opts.ReuseBothSplitInsertCapacity
+	m.maxReuseNodes = opts.MaxReuseNodes
+	return m
+}
+
+// SetReuseBothSplitInsertCapacity changes whether split-with-insert gives the
+// non-insert sibling full leaf capacity. Map is not safe for concurrent writes;
+// callers must synchronize this with other mutations.
+func (tr *Map[K, V]) SetReuseBothSplitInsertCapacity(enabled bool) {
+	tr.reuseBothSplitInsertCapacity = enabled
 }
 
 type mapNode[K ordered, V any] struct {
@@ -109,18 +157,93 @@ func (tr *Map[K, V]) Copy() *Map[K, V] {
 func (tr *Map[K, V]) IsoCopy() *Map[K, V] {
 	tr2 := new(Map[K, V])
 	*tr2 = *tr
+	tr2.freeLeaves = nil
+	tr2.freeBranches = nil
 	tr2.isoid = newIsoID()
 	tr.isoid = newIsoID()
 	return tr2
 }
 
 func (tr *Map[K, V]) newNode(leaf bool) *mapNode[K, V] {
+	if tr.reuseNodes {
+		var n *mapNode[K, V]
+		if leaf {
+			if len(tr.freeLeaves) > 0 {
+				i := len(tr.freeLeaves) - 1
+				n = tr.freeLeaves[i]
+				tr.freeLeaves[i] = nil
+				tr.freeLeaves = tr.freeLeaves[:i]
+			}
+		} else if len(tr.freeBranches) > 0 {
+			i := len(tr.freeBranches) - 1
+			n = tr.freeBranches[i]
+			tr.freeBranches[i] = nil
+			tr.freeBranches = tr.freeBranches[:i]
+		}
+		if n != nil {
+			n.isoid = tr.isoid
+			n.count = 0
+			n.items = n.items[:0]
+			if leaf {
+				n.children = nil
+			} else if n.children == nil {
+				n.children = new([]*mapNode[K, V])
+			} else {
+				*n.children = (*n.children)[:0]
+			}
+			return n
+		}
+	}
 	n := new(mapNode[K, V])
 	n.isoid = tr.isoid
 	if !leaf {
 		n.children = new([]*mapNode[K, V])
 	}
 	return n
+}
+
+func (tr *Map[K, V]) reuseNodeCount() int {
+	return len(tr.freeLeaves) + len(tr.freeBranches)
+}
+
+func (tr *Map[K, V]) canReuseNode() bool {
+	return tr.maxReuseNodes <= 0 || tr.reuseNodeCount() < tr.maxReuseNodes
+}
+
+func (tr *Map[K, V]) zeroItems(items []mapPair[K, V]) {
+	for i := range items {
+		items[i] = tr.empty
+	}
+}
+
+func (tr *Map[K, V]) zeroChildren(children []*mapNode[K, V]) {
+	for i := range children {
+		children[i] = nil
+	}
+}
+
+func (tr *Map[K, V]) recycleNode(n *mapNode[K, V]) {
+	if n == nil || !tr.reuseNodes || n.isoid != tr.isoid {
+		return
+	}
+	if !n.leaf() {
+		for _, child := range *n.children {
+			tr.recycleNode(child)
+		}
+	}
+	if !tr.canReuseNode() {
+		return
+	}
+	tr.zeroItems(n.items)
+	n.items = n.items[:0]
+	n.count = 0
+	if n.leaf() {
+		tr.freeLeaves = append(tr.freeLeaves, n)
+		return
+	}
+	tr.zeroChildren(*n.children)
+	*n.children = (*n.children)[:0]
+	tr.freeBranches = append(tr.freeBranches, n)
 }
 
 // leaf returns true if the node is a leaf.
@@ -161,7 +284,7 @@ func (tr *Map[K, V]) Set(key K, value V) (V, bool) {
 	if tr.root == nil {
 		tr.init(0)
 		tr.root = tr.newNode(true)
-		tr.root.items = append([]mapPair[K, V]{}, item)
+		tr.root.items = append(tr.root.items, item)
 		tr.root.count = 1
 		tr.count = 1
 		return tr.empty.value, false
@@ -169,11 +292,19 @@ func (tr *Map[K, V]) Set(key K, value V) (V, bool) {
 	prev, replaced, split := tr.nodeSet(&tr.root, item)
 	if split {
 		left := tr.root
-		right, median := tr.nodeSplit(left)
+		if left.leaf() {
+			right, median := tr.nodeSplitLeafWithInsert(left, item)
+			tr.root = tr.newNode(false)
+			*tr.root.children = append((*tr.root.children)[:0], left, right)
+			tr.root.items = append(tr.root.items[:0], median)
+			tr.root.updateCount()
+			tr.count++
+			return tr.empty.value, false
+		}
+		right, median := tr.nodeSplitForInsert(left, item.key)
 		tr.root = tr.newNode(false)
-		*tr.root.children = make([]*mapNode[K, V], 0, tr.max+1)
-		*tr.root.children = append([]*mapNode[K, V]{}, left, right)
-		tr.root.items = append([]mapPair[K, V]{}, median)
+		*tr.root.children = append((*tr.root.children)[:0], left, right)
+		tr.root.items = append(tr.root.items[:0], median)
 		tr.root.updateCount()
 		return tr.Set(item.key, item.value)
 	}
@@ -207,6 +338,119 @@ func (tr *Map[K, V]) nodeSplit(n *mapNode[K, V],
 	return right, median
 }
 
+func (tr *Map[K, V]) nodeSplitForAppend(n *mapNode[K, V],
+) (right *mapNode[K, V], median mapPair[K, V]) {
+	if !tr.reuseRightSplitCapacity || !n.leaf() {
+		return tr.nodeSplit(n)
+	}
+	i := tr.max / 2
+	median = n.items[i]
+	right = tr.newNode(true)
+	return tr.nodeSplitPreserveRight(n, right, i, median)
+}
+
+func (tr *Map[K, V]) nodeSplitForInsert(n *mapNode[K, V], key K,
+) (right *mapNode[K, V], median mapPair[K, V]) {
+	if !tr.reuseSplitInsertCapacity || !n.leaf() {
+		return tr.nodeSplit(n)
+	}
+	i := tr.max / 2
+	median = n.items[i]
+	right = tr.newNode(true)
+	if key < median.key {
+		return tr.nodeSplitPreserveLeft(n, right, i, median)
+	}
+	return tr.nodeSplitPreserveRight(n, right, i, median)
+}
+
+func (tr *Map[K, V]) nodeSplitPreserveRight(n, right *mapNode[K, V], i int,
+	median mapPair[K, V],
+) (*mapNode[K, V], mapPair[K, V]) {
+	old := n.items
+	leftItems := make([]mapPair[K, V], i, i)
+	copy(leftItems, old[:i])
+	rightLen := len(old) - i - 1
+	copy(old[:rightLen], old[i+1:])
+	tr.zeroItems(old[rightLen:])
+	right.items = old[:rightLen:cap(old)]
+	n.items = leftItems
+	right.updateCount()
+	n.updateCount()
+	return right, median
+}
+
+func (tr *Map[K, V]) nodeSplitPreserveLeft(n, right *mapNode[K, V], i int,
+	median mapPair[K, V],
+) (*mapNode[K, V], mapPair[K, V]) {
+	old := n.items
+	rightLen := len(old) - i - 1
+	rightItems := make([]mapPair[K, V], rightLen, rightLen)
+	copy(rightItems, old[i+1:])
+	tr.zeroItems(old[i:])
+	right.items = rightItems
+	n.items = old[:i:cap(old)]
+	right.updateCount()
+	n.updateCount()
+	return right, median
+}
+
+func (tr *Map[K, V]) nodeSplitLeafWithInsert(n *mapNode[K, V], item mapPair[K, V]) (
+	right *mapNode[K, V], median mapPair[K, V],
+) {
+	i, found := tr.search(n, item.key)
+	if found {
+		panic("btree: nodeSplitLeafWithInsert called for existing key")
+	}
+	old := n.items
+	total := len(old) + 1
+	mid := tr.max / 2
+	right = tr.newNode(true)
+	if i <= mid {
+		median = old[mid]
+		leftLen := mid + 1
+		rightLen := len(old) - mid - 1
+		rightCap := rightLen
+		if tr.reuseBothSplitInsertCapacity {
+			rightCap = tr.max
+		}
+		rightItems := make([]mapPair[K, V], rightLen, rightCap)
+		copy(rightItems, old[mid+1:])
+		copy(old[i+1:leftLen], old[i:mid])
+		old[i] = item
+		tr.zeroItems(old[leftLen:])
+		right.items = rightItems
+		n.items = old[:leftLen:cap(old)]
+		right.updateCount()
+		n.updateCount()
+		return right, median
+	}
+	median = old[mid]
+	leftLen := mid
+	leftCap := leftLen
+	if tr.reuseBothSplitInsertCapacity {
+		leftCap = tr.max
+	}
+	leftItems := make([]mapPair[K, V], leftLen, leftCap)
+	copy(leftItems, old[:leftLen])
+	rightLen := total - mid - 1
+	prefix := i - mid - 1
+	copy(old[:prefix], old[mid+1:i])
+	old[prefix] = item
+	copy(old[prefix+1:rightLen], old[i:])
+	tr.zeroItems(old[rightLen:])
+	right.items = old[:rightLen:cap(old)]
+	n.items = leftItems
+	right.updateCount()
+	n.updateCount()
+	return right, median
+}
+
+func (tr *Map[K, V]) insertLeafItem(n *mapNode[K, V], i int, item mapPair[K, V]) {
+	n.items = append(n.items, tr.empty)
+	copy(n.items[i+1:], n.items[i:])
+	n.items[i] = item
+}
+
 func (n *mapNode[K, V]) updateCount() {
 	n.count = len(n.items)
 	if !n.leaf() {
@@ -229,9 +473,7 @@ func (tr *Map[K, V]) nodeSet(pn **mapNode[K, V], item mapPair[K, V],
 		if len(n.items) == tr.max {
 			return tr.empty.value, false, true
 		}
-		n.items = append(n.items, tr.empty)
-		copy(n.items[i+1:], n.items[i:])
-		n.items[i] = item
+		tr.insertLeafItem(n, i, item)
 		n.count++
 		return tr.empty.value, false, false
 	}
@@ -240,13 +482,24 @@ func (tr *Map[K, V]) nodeSet(pn **mapNode[K, V], item mapPair[K, V],
 		if len(n.items) == tr.max {
 			return tr.empty.value, false, true
 		}
-		right, median := tr.nodeSplit((*n.children)[i])
+		left := (*n.children)[i]
+		var right *mapNode[K, V]
+		var median mapPair[K, V]
+		if left.leaf() {
+			right, median = tr.nodeSplitLeafWithInsert(left, item)
+		} else {
+			right, median = tr.nodeSplitForInsert(left, item.key)
+		}
 		*n.children = append(*n.children, nil)
 		copy((*n.children)[i+1:], (*n.children)[i:])
 		(*n.children)[i+1] = right
 		n.items = append(n.items, tr.empty)
 		copy(n.items[i+1:], n.items[i:])
 		n.items[i] = median
+		if left.leaf() {
+			n.updateCount()
+			return tr.empty.value, false, false
+		}
 		return tr.nodeSet(&n, item)
 	}
 	if !replaced {
@@ -640,6 +893,8 @@ func (tr *Map[K, V]) Load(key K, value V) (V, bool) {
 					tr.count++
 					return tr.empty.value, false
 				}
+			} else if n.items[len(n.items)-1].key < item.key {
+				break
 			}
 			break
 		}
@@ -654,7 +909,39 @@ func (tr *Map[K, V]) Load(key K, value V) (V, bool) {
 		}
 		n = (*n.children)[len(*n.children)-1]
 	}
+	if n.items[len(n.items)-1].key < item.key {
+		return tr.loadAppend(item)
+	}
 	return tr.Set(item.key, item.value)
+}
+
+func (tr *Map[K, V]) loadAppend(item mapPair[K, V]) (V, bool) {
+	if len(tr.root.items) == tr.max {
+		left := tr.root
+		right, median := tr.nodeSplitForAppend(left)
+		tr.root = tr.newNode(false)
+		*tr.root.children = append((*tr.root.children)[:0], left, right)
+		tr.root.items = append(tr.root.items[:0], median)
+		tr.root.updateCount()
+	}
+	n := tr.isoLoad(&tr.root, true)
+	for {
+		n.count++
+		if n.leaf() {
+			n.items = append(n.items, item)
+			tr.count++
+			return tr.empty.value, false
+		}
+		childIdx := len(*n.children) - 1
+		child := tr.isoLoad(&(*n.children)[childIdx], true)
+		if len(child.items) == tr.max {
+			right, median := tr.nodeSplitForAppend(child)
+			n.items = append(n.items, median)
+			*n.children = append(*n.children, right)
+			childIdx = len(*n.children) - 1
+		}
+		n = tr.isoLoad(&(*n.children)[childIdx], true)
+	}
 }
 
 // Min returns the minimum item in tree.
@@ -1207,6 +1494,9 @@ func (tr *Map[K, V]) nodeKeyValues(cn **mapNode[K, V], keys []K, values []V,
 
 // Clear will delete all items.
 func (tr *Map[K, V]) Clear() {
+	if tr.reuseNodes {
+		tr.recycleNode(tr.root)
+	}
 	tr.count = 0
 	tr.root = nil
 }
