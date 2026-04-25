@@ -1498,6 +1498,146 @@ func TestMapSetReuseBothSplitInsertCapacity(t *testing.T) {
 	}
 }
 
+func TestMapLeafItemArenaSplitCorrectness(t *testing.T) {
+	m := NewMapWithOptions[int, int](4, MapOptions{
+		ReuseRightSplitCapacity:  true,
+		ReuseSplitInsertCapacity: true,
+		LeafItemArena:            true,
+		LeafItemArenaChunkPairs:  64,
+	})
+	order := []int{40, 10, 70, 20, 60, 30, 50, 0, 80, 90, 15, 25, 35, 45, 55, 65, 75, 85}
+	for _, key := range order {
+		m.Set(key, key*10)
+	}
+	if len(m.leafItemChunks) == 0 {
+		t.Fatal("expected leaf item arena chunks after split-heavy inserts")
+	}
+	if got, want := m.Len(), len(order); got != want {
+		t.Fatalf("Len()=%d want %d", got, want)
+	}
+	for _, key := range order {
+		if got, ok := m.Get(key); !ok || got != key*10 {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", key, got, ok, key*10)
+		}
+	}
+}
+
+func TestMapLeafItemArenaClearReusesChunks(t *testing.T) {
+	m := NewMapWithOptions[int, int](4, MapOptions{
+		ReuseSplitInsertCapacity: true,
+		LeafItemArena:            true,
+		LeafItemArenaChunkPairs:  64,
+	})
+	for i := 0; i < 256; i++ {
+		m.Set((i*37)%257, i)
+	}
+	chunks := len(m.leafItemChunks)
+	if chunks == 0 {
+		t.Fatal("expected leaf item arena chunks before clear")
+	}
+	m.Clear()
+	if got := m.Len(); got != 0 {
+		t.Fatalf("Len() after Clear=%d want 0", got)
+	}
+	if got := len(m.leafItemChunks); got != chunks {
+		t.Fatalf("leaf item chunks after Clear=%d want %d", got, chunks)
+	}
+	for i := 0; i < 128; i++ {
+		m.Set(i, i)
+	}
+	if got := len(m.leafItemChunks); got > chunks {
+		t.Fatalf("leaf item chunks after refill=%d want <= %d", got, chunks)
+	}
+	for i := 0; i < 128; i++ {
+		if got, ok := m.Get(i); !ok || got != i {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", i, got, ok, i)
+		}
+	}
+}
+
+func TestMapNodeArenaSplitCorrectness(t *testing.T) {
+	m := NewMapWithOptions[int, int](4, MapOptions{
+		ReuseRightSplitCapacity:  true,
+		ReuseSplitInsertCapacity: true,
+		LeafItemArena:            true,
+		LeafItemArenaChunkPairs:  64,
+		NodeArena:                true,
+		NodeArenaChunkNodes:      8,
+	})
+	for i := 0; i < 256; i++ {
+		key := (i * 83) % 257
+		m.Set(key, i)
+	}
+	if len(m.nodeChunks) == 0 {
+		t.Fatal("expected node arena chunks after split-heavy inserts")
+	}
+	for i := 0; i < 256; i++ {
+		key := (i * 83) % 257
+		if got, ok := m.Get(key); !ok || got != i {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", key, got, ok, i)
+		}
+	}
+}
+
+func TestMapNodeArenaClearReusesChunks(t *testing.T) {
+	m := NewMapWithOptions[int, int](4, MapOptions{
+		ReuseSplitInsertCapacity: true,
+		NodeArena:                true,
+		NodeArenaChunkNodes:      8,
+	})
+	for i := 0; i < 128; i++ {
+		m.Set((i*41)%131, i)
+	}
+	chunks := len(m.nodeChunks)
+	if chunks == 0 {
+		t.Fatal("expected node arena chunks before clear")
+	}
+	m.Clear()
+	if got := m.Len(); got != 0 {
+		t.Fatalf("Len() after Clear=%d want 0", got)
+	}
+	if got := len(m.nodeChunks); got != chunks {
+		t.Fatalf("node chunks after Clear=%d want %d", got, chunks)
+	}
+	for i := 0; i < 64; i++ {
+		m.Set(i, i)
+	}
+	if got := len(m.nodeChunks); got > chunks {
+		t.Fatalf("node chunks after refill=%d want <= %d", got, chunks)
+	}
+	for i := 0; i < 64; i++ {
+		if got, ok := m.Get(i); !ok || got != i {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", i, got, ok, i)
+		}
+	}
+}
+
+func TestMapArenasIsoCopyClearDoesNotCorruptCopy(t *testing.T) {
+	m := NewMapWithOptions[int, int](4, MapOptions{
+		ReuseRightSplitCapacity:  true,
+		ReuseSplitInsertCapacity: true,
+		LeafItemArena:            true,
+		LeafItemArenaChunkPairs:  64,
+		NodeArena:                true,
+		NodeArenaChunkNodes:      8,
+	})
+	for i := 0; i < 256; i++ {
+		key := (i * 83) % 257
+		m.Set(key, i)
+	}
+	copied := m.IsoCopy()
+	m.Clear()
+	if got := m.Len(); got != 0 {
+		t.Fatalf("Len() after Clear=%d want 0", got)
+	}
+	for i := 0; i < 256; i++ {
+		key := (i * 83) % 257
+		if got, ok := copied.Get(key); !ok || got != i {
+			t.Fatalf("copied.Get(%d)=(%d,%t), want (%d,true)", key, got, ok, i)
+		}
+	}
+}
+
 func TestMapLoadAppendSplitsFullRightEdge(t *testing.T) {
 	m := NewMapWithOptions[int, int](2, MapOptions{ReuseSplitInsertCapacity: true})
 	for i := 0; i < 128; i++ {
