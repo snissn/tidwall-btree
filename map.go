@@ -45,20 +45,21 @@ type mapPair[K ordered, V any] struct {
 }
 
 type Map[K ordered, V any] struct {
-	isoid                    uint64
-	root                     *mapNode[K, V]
-	count                    int
-	empty                    mapPair[K, V]
-	min                      int // min items
-	max                      int // max items
-	copyValues               bool
-	isoCopyValues            bool
-	reuseNodes               bool
-	reuseRightSplitCapacity  bool
-	reuseSplitInsertCapacity bool
-	maxReuseNodes            int
-	freeLeaves               []*mapNode[K, V]
-	freeBranches             []*mapNode[K, V]
+	isoid                        uint64
+	root                         *mapNode[K, V]
+	count                        int
+	empty                        mapPair[K, V]
+	min                          int // min items
+	max                          int // max items
+	copyValues                   bool
+	isoCopyValues                bool
+	reuseNodes                   bool
+	reuseRightSplitCapacity      bool
+	reuseSplitInsertCapacity     bool
+	reuseBothSplitInsertCapacity bool
+	maxReuseNodes                int
+	freeLeaves                   []*mapNode[K, V]
+	freeBranches                 []*mapNode[K, V]
 }
 
 func NewMap[K ordered, V any](degree int) *Map[K, V] {
@@ -81,6 +82,11 @@ type MapOptions struct {
 	// the side that will receive the pending insert. This avoids the immediate
 	// post-split append allocation for mixed insert workloads.
 	ReuseSplitInsertCapacity bool
+	// ReuseBothSplitInsertCapacity also gives the split sibling full leaf
+	// capacity during a split-with-insert. This reduces future growth
+	// allocations for non-append-heavy insert streams, at the cost of retaining
+	// more leaf capacity per split.
+	ReuseBothSplitInsertCapacity bool
 	// MaxReuseNodes bounds retained nodes when ReuseNodes is enabled. Values
 	// less than or equal to zero retain all owned nodes.
 	MaxReuseNodes int
@@ -91,8 +97,16 @@ func NewMapWithOptions[K ordered, V any](degree int, opts MapOptions) *Map[K, V]
 	m.reuseNodes = opts.ReuseNodes
 	m.reuseRightSplitCapacity = opts.ReuseRightSplitCapacity
 	m.reuseSplitInsertCapacity = opts.ReuseSplitInsertCapacity
+	m.reuseBothSplitInsertCapacity = opts.ReuseBothSplitInsertCapacity
 	m.maxReuseNodes = opts.MaxReuseNodes
 	return m
+}
+
+// SetReuseBothSplitInsertCapacity changes whether split-with-insert gives the
+// non-insert sibling full leaf capacity. Map is not safe for concurrent writes;
+// callers must synchronize this with other mutations.
+func (tr *Map[K, V]) SetReuseBothSplitInsertCapacity(enabled bool) {
+	tr.reuseBothSplitInsertCapacity = enabled
 }
 
 type mapNode[K ordered, V any] struct {
@@ -395,7 +409,11 @@ func (tr *Map[K, V]) nodeSplitLeafWithInsert(n *mapNode[K, V], item mapPair[K, V
 		median = old[mid]
 		leftLen := mid + 1
 		rightLen := len(old) - mid - 1
-		rightItems := make([]mapPair[K, V], rightLen, rightLen)
+		rightCap := rightLen
+		if tr.reuseBothSplitInsertCapacity {
+			rightCap = tr.max
+		}
+		rightItems := make([]mapPair[K, V], rightLen, rightCap)
 		copy(rightItems, old[mid+1:])
 		copy(old[i+1:leftLen], old[i:mid])
 		old[i] = item
@@ -408,7 +426,11 @@ func (tr *Map[K, V]) nodeSplitLeafWithInsert(n *mapNode[K, V], item mapPair[K, V
 	}
 	median = old[mid]
 	leftLen := mid
-	leftItems := make([]mapPair[K, V], leftLen, leftLen)
+	leftCap := leftLen
+	if tr.reuseBothSplitInsertCapacity {
+		leftCap = tr.max
+	}
+	leftItems := make([]mapPair[K, V], leftLen, leftCap)
 	copy(leftItems, old[:leftLen])
 	rightLen := total - mid - 1
 	prefix := i - mid - 1

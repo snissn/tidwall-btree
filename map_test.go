@@ -1446,6 +1446,58 @@ func TestMapReuseSplitInsertCapacityPreservesRightForRightInsert(t *testing.T) {
 	}
 }
 
+func TestMapReuseBothSplitInsertCapacityPreservesSiblingForLeftInsert(t *testing.T) {
+	m := NewMapWithOptions[int, int](4, MapOptions{
+		ReuseSplitInsertCapacity:     true,
+		ReuseBothSplitInsertCapacity: true,
+	})
+	for i := 0; i < m.max; i++ {
+		m.Load(i, i)
+	}
+	m.Set(-1, -1)
+	if m.root.leaf() {
+		t.Fatal("expected split root")
+	}
+	left := (*m.root.children)[0]
+	right := (*m.root.children)[1]
+	if got, wantMin := cap(left.items), m.max; got < wantMin {
+		t.Fatalf("left cap=%d want >= %d", got, wantMin)
+	}
+	if got, wantMin := cap(right.items), m.max; got < wantMin {
+		t.Fatalf("right cap=%d want >= %d", got, wantMin)
+	}
+	for i := -1; i < m.max; i++ {
+		if v, ok := m.Get(i); !ok || v != i {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", i, v, ok, i)
+		}
+	}
+}
+
+func TestMapSetReuseBothSplitInsertCapacity(t *testing.T) {
+	m := NewMapWithOptions[int, int](4, MapOptions{ReuseSplitInsertCapacity: true})
+	m.SetReuseBothSplitInsertCapacity(true)
+	for i := 0; i < m.max; i++ {
+		m.Load(i, i)
+	}
+	m.Set(m.max, m.max)
+	if m.root.leaf() {
+		t.Fatal("expected split root")
+	}
+	left := (*m.root.children)[0]
+	right := (*m.root.children)[1]
+	if got, wantMin := cap(left.items), m.max; got < wantMin {
+		t.Fatalf("left cap=%d want >= %d", got, wantMin)
+	}
+	if got, wantMin := cap(right.items), m.max; got < wantMin {
+		t.Fatalf("right cap=%d want >= %d", got, wantMin)
+	}
+	for i := 0; i <= m.max; i++ {
+		if v, ok := m.Get(i); !ok || v != i {
+			t.Fatalf("Get(%d)=(%d,%t), want (%d,true)", i, v, ok, i)
+		}
+	}
+}
+
 func TestMapLoadAppendSplitsFullRightEdge(t *testing.T) {
 	m := NewMapWithOptions[int, int](2, MapOptions{ReuseSplitInsertCapacity: true})
 	for i := 0; i < 128; i++ {
