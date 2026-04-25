@@ -103,9 +103,10 @@ type MapOptions struct {
 	// Load-heavy workloads where the right side is likely to receive more
 	// appends soon after the split.
 	ReuseRightSplitCapacity bool
-	// ReuseSplitInsertCapacity makes leaf splits preserve backing capacity on
-	// the side that will receive the pending insert. This avoids the immediate
-	// post-split append allocation for mixed insert workloads.
+	// ReuseSplitInsertCapacity makes non-direct leaf splits preserve backing
+	// capacity on the side that will receive the pending insert. Full-leaf Set
+	// inserts use a direct split-with-insert path that already preserves the
+	// insert side.
 	ReuseSplitInsertCapacity bool
 	// ReuseBothSplitInsertCapacity also gives the split sibling full leaf
 	// capacity during a split-with-insert. This reduces future growth
@@ -993,6 +994,7 @@ func (tr *Map[K, V]) removeLeafItem(n *mapNode[K, V], i int) mapPair[K, V] {
 		n.slots[len(n.slots)-1] = 0
 		n.slots = n.slots[:len(n.slots)-1]
 		n.items[slot] = tr.empty
+		n.free = append(n.free, slot)
 		return prev
 	}
 	prev := n.items[i]

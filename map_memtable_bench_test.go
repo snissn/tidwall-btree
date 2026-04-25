@@ -211,11 +211,13 @@ func BenchmarkMapMemtableLoadSorted(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		m := NewMapWithOptions[string, memtableBenchValue](32, opts)
-		m.LoadSorted(n, func(i int) string {
+		if !m.LoadSorted(n, func(i int) string {
 			return keys[i]
 		}, func(i int) memtableBenchValue {
 			return value
-		})
+		}) {
+			b.Fatal("LoadSorted failed")
+		}
 		memtableBenchSink += m.Len()
 	}
 }
