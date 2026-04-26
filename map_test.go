@@ -1841,6 +1841,46 @@ func TestMapLeafSlotIndexLoadSorted(t *testing.T) {
 	}
 }
 
+func TestMapLeafSlotIndexFreeListAllocatedLazily(t *testing.T) {
+	m := NewMapWithOptions[int, int](32, MapOptions{
+		ReuseRightSplitCapacity:  true,
+		ReuseSplitInsertCapacity: true,
+		LeafSlotIndex:            true,
+		LeafItemArena:            true,
+		NodeArena:                true,
+	})
+	m.Set(1, 10)
+	if got := cap(m.root.free); got != 0 {
+		t.Fatalf("fresh leaf free cap=%d, want 0", got)
+	}
+	for i := 2; i <= m.max+1; i++ {
+		m.Set(i, i*10)
+	}
+	var sawCompactFree bool
+	var visit func(*mapNode[int, int])
+	visit = func(n *mapNode[int, int]) {
+		if n == nil {
+			return
+		}
+		if n.leaf() {
+			if len(n.free) > 0 && cap(n.free) < m.max {
+				sawCompactFree = true
+			}
+			return
+		}
+		for _, child := range *n.children {
+			visit(child)
+		}
+	}
+	visit(m.root)
+	if !sawCompactFree {
+		t.Fatalf("expected split leaf to allocate compact free list below max=%d", m.max)
+	}
+	if err := m.Sane(); err != nil {
+		t.Fatalf("Sane() error: %v", err)
+	}
+}
+
 func TestMapLeafItemArenaClearCapsRetainedChunks(t *testing.T) {
 	const retain = 2
 	m := NewMapWithOptions[int, int](4, MapOptions{
