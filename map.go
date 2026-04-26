@@ -284,11 +284,7 @@ func (tr *Map[K, V]) newNode(leaf bool) *mapNode[K, V] {
 					} else {
 						n.slots = n.slots[:0]
 					}
-					if cap(n.free) < tr.max {
-						n.free = tr.newLeafSlots(0, tr.max)
-					} else {
-						n.free = n.free[:0]
-					}
+					n.free = n.free[:0]
 				} else {
 					n.slots = nil
 					n.free = nil
@@ -311,7 +307,6 @@ func (tr *Map[K, V]) newNode(leaf bool) *mapNode[K, V] {
 		n.children = new([]*mapNode[K, V])
 	} else if tr.leafSlotIndex {
 		n.slots = tr.newLeafSlots(0, tr.max)
-		n.free = tr.newLeafSlots(0, tr.max)
 	}
 	return n
 }
@@ -442,6 +437,31 @@ func (tr *Map[K, V]) newLeafSlots(length, capacity int) []uint16 {
 		}
 		tr.leafSlotChunks = append(tr.leafSlotChunks, make([]uint16, chunkSlots))
 	}
+}
+
+func (tr *Map[K, V]) appendLeafFreeSlot(n *mapNode[K, V], slot uint16) {
+	if len(n.free) < cap(n.free) {
+		n.free = append(n.free, slot)
+		return
+	}
+	needed := len(n.free) + 1
+	if needed > tr.max {
+		panic("btree: leaf free slot overflow")
+	}
+	newCap := cap(n.free) * 2
+	if newCap < 8 {
+		newCap = 8
+	}
+	if newCap < needed {
+		newCap = needed
+	}
+	if newCap > tr.max {
+		newCap = tr.max
+	}
+	free := tr.newLeafSlots(len(n.free), newCap)
+	copy(free, n.free)
+	free = append(free, slot)
+	n.free = free
 }
 
 func (tr *Map[K, V]) resetLeafItemArena() {
@@ -753,7 +773,7 @@ func (tr *Map[K, V]) freeLogicalLeafRange(dst, src *mapNode[K, V], start, end in
 	for i := start; i < end; i++ {
 		slot := src.slots[i]
 		src.items[slot] = tr.empty
-		dst.free = append(dst.free, slot)
+		tr.appendLeafFreeSlot(dst, slot)
 	}
 }
 
@@ -888,7 +908,7 @@ func (tr *Map[K, V]) nodeSplitLeafSlotsWithInsert(
 			slot := n.slots[j]
 			n.items[slot] = tr.empty
 			if slot != newSlot {
-				n.free = append(n.free, slot)
+				tr.appendLeafFreeSlot(n, slot)
 			}
 		}
 		n.items[newSlot] = item
@@ -916,7 +936,7 @@ func (tr *Map[K, V]) nodeSplitLeafSlotsWithInsert(
 		slot := n.slots[j]
 		n.items[slot] = tr.empty
 		if slot != newSlot {
-			right.free = append(right.free, slot)
+			tr.appendLeafFreeSlot(right, slot)
 		}
 	}
 	n.items[newSlot] = item
@@ -1004,7 +1024,7 @@ func (tr *Map[K, V]) removeLeafItem(n *mapNode[K, V], i int) mapPair[K, V] {
 		n.slots[len(n.slots)-1] = 0
 		n.slots = n.slots[:len(n.slots)-1]
 		n.items[slot] = tr.empty
-		n.free = append(n.free, slot)
+		tr.appendLeafFreeSlot(n, slot)
 		return prev
 	}
 	prev := n.items[i]
